@@ -157,6 +157,12 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
 - **Server-side limits.** The FortiAnalyzer SQL dialect only allows read queries and rejects write or
   unsafe statements itself. The tool additionally refuses anything but a single `SELECT` / `WITH` before
   sending it.
+- **Concurrency.** At most `FAZ_MAX_JOBS` queries (default 2) run at once per server instance; a further
+  one is rejected until one finishes. Long queries continue in the background (`faz_query_status`).
+- **Log types without a name in the tool.** FortiSandbox `malware` and `netalert` aren't in the tool's
+  log-type list. Pass `dev='fortisandbox', log='event'` and write `FROM $log-malware` in the SQL: the
+  macro decides which table is read.
+- **Dates.** `toDate()` and `dtime` come back as Unix epoch numbers; wrap them in `toString()`.
 - **Passwords.** The `.env` file holds the password in plain text: keep it git-ignored and readable only
   by you. Avoid `claude mcp add --env FAZ_PASSWORD=...`, which stores it in your Claude configuration
   instead. Use a dedicated account with minimal rights.

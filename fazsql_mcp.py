@@ -222,6 +222,13 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     elapsed_seconds} and keeps running: follow it with faz_query_status(job_id) instead of
     submitting the query again, or stop it with faz_query_cancel(job_id). Tell the user a
     long query is in progress; a shorter period or tighter filter usually finishes faster.
+    At most FAZ_MAX_JOBS queries (default 2) run at once; a further one is rejected until one
+    finishes.
+
+    Log types this tool doesn't list by name, such as FortiSandbox `malware` and `netalert`:
+    pass a log type it accepts for that device (dev='fortisandbox', log='event') and keep
+    FROM $log-malware in the SQL; the macro decides the table. Dates from toDate() and dtime
+    come back as Unix epoch numbers; wrap them in toString() for readable dates.
 
     Returns {status: "done", headers, rows, truncated, adom, dev, log, job_id}; `adom` is the
     ADOM that was queried.
