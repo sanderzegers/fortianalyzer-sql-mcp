@@ -35,6 +35,7 @@ Use a dedicated account with only the report viewer / run report rights.
 
 CLI:
   fazsql.py --dev fortigate --period 7d "select ... from $log-dns where $filter ..."
+  fazsql.py --period custom --start=-24h "select ..."
   fazsql.py --list-types [--dev fortigate]
   fazsql.py --columns dns [--dev fortigate]
 Library:
@@ -112,6 +113,11 @@ PERIODS = {
     'this-year': 15, 'custom': 16,
 }
 PERIOD_NEEDS_N = {2, 6, 12}
+PERIOD_CUSTOM = 16
+# custom start/end may be relative to the FAZ clock: 'now', '-90m', '-24h', '-7d', '-2w'
+_RELATIVE = re.compile(r'^(?:now|-(\d+)([mhdw]))$')
+_UNIT_SECONDS = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+_ABSOLUTE = re.compile(r'^\d{1,2}:\d{2} \d{4}/\d{1,2}/\d{1,2}$')
 
 # `$log-<name>` macros whose name differs from the log type id
 MACRO_ALIASES = {'ips': 'attack'}
@@ -456,23 +462,89 @@ class FazSql:
         period_n = _resolve(period, PERIODS, 'period')
         if period_n in PERIOD_NEEDS_N and last_n < 1:
             raise FazError('period %r needs last_n >= 1' % period)
-        if period_n == 16 and not (start and end):
-            raise FazError("period 'custom' needs start and end")
+        start, end = start.strip().lower(), end.strip().lower()
+        if period_n == PERIOD_CUSTOM:
+            for v in (start, end):
+                if v and not (_RELATIVE.match(v) or _ABSOLUTE.match(v)):
+                    raise FazError("bad custom time %r: use 'hh:mm YYYY/MM/DD' or relative "
+                                   "'now', '-90m', '-24h', '-7d', '-2w'" % v)
+            if not start:
+                raise FazError("period 'custom' needs start")
+            if not end:
+                if not _RELATIVE.match(start):
+                    raise FazError("period 'custom' needs end (it may only be left out when start "
+                                   "is relative, such as '-24h')")
+                end = 'now'
+        elif start or end:
+            raise FazError("start/end are only used with period 'custom'")
         return sql, dev_n, log_n, period_n, last_n, start, end
+
+    def _probe(self, sql, args, lock=None):
+        """First row of a small helper query run with the period of `args`, as a dict."""
+        r = self._execute(sql, *args[1:], 60, 0.5, lock=lock)
+        if not r['rows']:
+            raise FazError('probe returned no row')
+        return dict(zip(r['headers'], r['rows'][0]))
+
+    def resolve_relative(self, args, lock=None):
+        """Replace relative custom start/end ('now', '-24h') with times on the FAZ clock.
+
+        FAZ reads custom times in its own time zone with minute precision, and the end is
+        inclusive only up to hh:mm:00. So the start is rounded down and the end up to a whole
+        minute; the window covers the asked span plus at most a minute on either side.
+        """
+        start, end = args[5], args[6]
+        if args[3] != PERIOD_CUSTOM or not (_RELATIVE.match(start) or _RELATIVE.match(end)):
+            return args
+        def ago(v):
+            m = _RELATIVE.match(v)
+            return int(m.group(1)) * _UNIT_SECONDS[m.group(2)] if m and m.group(1) else 0
+        exprs = []
+        for name, v, rnd in (('s', start, 0), ('e', end, 59)):
+            if _RELATIVE.match(v):
+                exprs.append('toString(toStartOfMinute(toDateTime(toUnixTimestamp(now()) - %d + %d)))'
+                             ' as %s' % (ago(v), rnd, name))
+        row = self._probe('select ' + ', '.join(exprs),
+                          args[:3] + (0, 0, '', ''), lock)  # period 'today': no custom needed
+        def fmt(v):  # 'YYYY-MM-DD hh:mm:ss' -> 'hh:mm YYYY/MM/DD'
+            d, t = v.split(' ')
+            return '%s %s' % (t[:5], d.replace('-', '/'))
+        start = fmt(row['s']) if 's' in row else start
+        end = fmt(row['e']) if 'e' in row else end
+        return args[:5] + (start, end)
+
+    def window(self, args, lock=None):
+        """The time range $filter covers for `args`, in the FAZ's time zone."""
+        row = self._probe('select toString(toDateTime($start_time)) as s, '
+                          'toString(toDateTime($end_time)) as e, timezone() as tz', args, lock)
+        return {'start': row['s'], 'end': row['e'], 'tz': row['tz']}
 
     def query(self, sql, dev='fortigate', log=None, period='7d', last_n=0,
               start='', end='', timeout=120, poll=1.0, read_only=True, lock=None, cancelled=None):
-        """Run one query and return {'headers','rows','truncated','adom','dev','log'}.
+        """Run one query and return {'headers','rows','truncated','window','adom','dev','log'}.
 
         dev/log accept names ('fortigate', 'dns') or numbers. When log is omitted it is taken
         from the first `$log-<type>` macro in the SQL (a bare `$log` falls back to traffic).
-        period is a name from PERIODS; 'custom' needs start/end ('hh:mm YYYY/MM/DD'), the
-        last-n-* ones need last_n. At most ROW_CAP rows come back; `truncated` is True when
-        the cap was reached. lock/cancelled: see _execute.
+        period is a name from PERIODS; 'custom' needs start/end ('hh:mm YYYY/MM/DD' in the FAZ
+        time zone, or relative: 'now', '-90m', '-24h', '-7d', '-2w'; end defaults to 'now'
+        for a relative start), the last-n-* ones need last_n. At most ROW_CAP rows come back;
+        `truncated` is True when the cap was reached. `window` is the time range $filter
+        covered ({start, end, tz}), absent if it couldn't be read. lock/cancelled: see _execute.
         """
         args = self._prepare(sql, dev, log, period, last_n, start, end, read_only)
+        return self.run_prepared(args, timeout, poll, lock=lock, cancelled=cancelled)
+
+    def run_prepared(self, args, timeout, poll=1.0, lock=None, cancelled=None):
+        """Run the arguments from _prepare: resolve relative times, query, add the window."""
+        args = self.resolve_relative(args, lock)
         result = self._execute(*args, timeout, poll, lock=lock, cancelled=cancelled)
         result.update(adom=self.session_adom, dev=args[1], log=args[2])
+        try:
+            result['window'] = self.window(args, lock)
+        except FazCancelled:
+            raise
+        except FazError:
+            pass  # the rows are what matters; the window is a convenience
         return result
 
     def columns(self, log, dev='fortigate', period='7d'):
@@ -517,9 +589,11 @@ def _print(result, fmt):
         print('\t'.join(h))
         for r in rows:
             print('\t'.join(r))
-    note = '(%d rows%s%s)' % (len(rows), ', truncated at %d - add GROUP BY/filters' % ROW_CAP
-                              if result['truncated'] else '',
-                              ', ADOM %s' % result['adom'] if result.get('adom') else '')
+    w = result.get('window')
+    note = '(%d rows%s%s%s)' % (len(rows), ', truncated at %d - add GROUP BY/filters' % ROW_CAP
+                                if result['truncated'] else '',
+                                ', ADOM %s' % result['adom'] if result.get('adom') else '',
+                                ', %s - %s %s' % (w['start'], w['end'], w['tz']) if w else '')
     print(note, file=sys.stderr)
 
 
@@ -531,8 +605,10 @@ def main(argv=None):
                     help='log type name or number (default: from the $log-<type> macro, else traffic)')
     ap.add_argument('--period', default='7d', help='one of: ' + ', '.join(PERIODS))
     ap.add_argument('--last-n', type=int, default=0, help='N for last-n-* periods')
-    ap.add_argument('--start', default='', help="custom start 'hh:mm YYYY/MM/DD'")
-    ap.add_argument('--end', default='', help="custom end 'hh:mm YYYY/MM/DD'")
+    ap.add_argument('--start', default='',
+                    help="custom start: 'hh:mm YYYY/MM/DD' (FAZ time zone) or relative ('-24h')")
+    ap.add_argument('--end', default='',
+                    help="custom end: 'hh:mm YYYY/MM/DD' or 'now' / '-1h' (default 'now' for a relative start)")
     ap.add_argument('--timeout', type=int, default=120)
     ap.add_argument('--format', choices=('tsv', 'csv', 'json'), default='tsv')
     ap.add_argument('--columns', metavar='LOG', help='list the columns of a log type (needs data)')

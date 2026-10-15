@@ -115,8 +115,7 @@ def _job_worker(job, kwargs):
         with _lock:
             faz = _session()
             args = faz._prepare(read_only=True, **kwargs)
-        result = faz._execute(*args, JOB_TIMEOUT, 1.0, lock=_lock, cancelled=job.cancel)
-        result.update(adom=faz.session_adom, dev=args[1], log=args[2])
+        result = faz.run_prepared(args, JOB_TIMEOUT, lock=_lock, cancelled=job.cancel)
         job.result, job.state = result, 'done'
     except fazsql.FazCancelled:
         job.state = 'cancelled'
@@ -207,8 +206,18 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     invalid dev/log combination is rejected, so call faz_list_types if unsure.
 
     period: today, yesterday, this-week, last-week, 7d, 14d, 30d, this-month, last-month,
-    this-quarter, last-quarter, this-year, custom (needs start and end as 'hh:mm YYYY/MM/DD'),
-    or last-n-hours / last-n-days / last-n-weeks (needs last_n >= 1).
+    this-quarter, last-quarter, this-year, last-n-hours / last-n-days / last-n-weeks (needs
+    last_n >= 1), or custom (needs start; end defaults to 'now' for a relative start).
+    All periods are in the FAZ's time zone. 7d, 14d, 30d and last-n-days are whole days ending
+    yesterday 23:59:59, so they EXCLUDE TODAY; last-n-hours ends at the last full hour;
+    last-n-weeks is whole Sunday-Saturday weeks before this one. today/this-* run up to now. For
+    "the last 24 hours" or anything up to now, use period='custom', start='-24h' (relative:
+    'now', '-90m', '-24h', '-7d', '-2w'), or today. Absolute custom times are
+    'hh:mm YYYY/MM/DD' in FAZ time; the end is inclusive only up to hh:mm:00.
+    Every result has `window` {start, end, tz}: the range $filter covered. State it when you
+    report numbers. Times in SQL: $flex_timescale() and from_itime() show FAZ time, but
+    toString/toDate/toHour(itime) give UTC; dtime is each device's own clock, which can differ
+    by hours between devices, so compare devices on itime.
 
     At most 100 rows are returned (`truncated` is true when the cap is hit), whatever the SQL
     LIMIT says. Prefer GROUP BY, ORDER BY ... LIMIT and tight filters over raw rows; use a
@@ -230,8 +239,8 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     FROM $log-malware in the SQL; the macro decides the table. Dates from toDate() and dtime
     come back as Unix epoch numbers; wrap them in toString() for readable dates.
 
-    Returns {status: "done", headers, rows, truncated, adom, dev, log, job_id}; `adom` is the
-    ADOM that was queried.
+    Returns {status: "done", headers, rows, truncated, window, adom, dev, log, job_id}; `adom`
+    is the ADOM that was queried.
     """
     try:
         job = _submit(sql, dev=dev, log=log or None, period=period, last_n=last_n,
