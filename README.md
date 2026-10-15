@@ -12,7 +12,8 @@ install on the FortiAnalyzer and no SSH access is needed.
 
 ## Features
 
-- `faz_query`: run one query and get `{headers, rows, truncated, adom, dev, log}` back
+- `faz_query`: run one query and get `{headers, rows, truncated, window, adom, dev, log}` back. `window`
+  is the time range the query covered, in the FortiAnalyzer's time zone
 - `faz_query_status` / `faz_query_cancel`: follow or stop a long-running query. `faz_query` runs
   queries as background jobs and waits up to `wait` seconds (default 60). If the query is still running
   it returns `{status: "running", job_id}` instead of blocking, and the other tools stay usable
@@ -126,7 +127,26 @@ last 7 days, and what did the top one look up?"*. Claude writes the query with t
 | `sql` | The query. Use `$log-<type>` as the table and `$filter` in `WHERE` |
 | `dev` | Device type: `fortigate` (default), `fortiproxy`, `fortiweb`, `fortimail`, ... |
 | `log` | Log type: `traffic`, `dns`, `attack`, `webfilter`, `event`, ... Optional, taken from the `$log-<type>` macro |
-| `period` | `today`, `yesterday`, `7d` (default), `14d`, `30d`, `this-week`, `last-week`, `this-month`, `last-month`, `this-quarter`, `last-quarter`, `this-year`, `custom` (with `start` and `end`, format `hh:mm YYYY/MM/DD`), or `last-n-hours` / `last-n-days` / `last-n-weeks` (with `last_n`) |
+| `period` | `today`, `yesterday`, `7d` (default), `14d`, `30d`, `this-week`, `last-week`, `this-month`, `last-month`, `this-quarter`, `last-quarter`, `this-year`, `last-n-hours` / `last-n-days` / `last-n-weeks` (with `last_n`), or `custom` (with `start` and `end`) |
+| `start`, `end` | For `custom`: `hh:mm YYYY/MM/DD` in the FortiAnalyzer's time zone, or relative to its clock: `now`, `-90m`, `-24h`, `-7d`, `-2w`. With a relative `start`, `end` defaults to `now` |
+
+### Time periods
+
+The periods are FortiAnalyzer's own report periods, in the FortiAnalyzer's time zone. Some of them stop
+before the current day or hour:
+
+| Period | Covers |
+|---|---|
+| `today`, `this-week`, `this-month`, ... | From the start of the day, week, ... up to now. Weeks start on Sunday |
+| `7d`, `14d`, `30d`, `last-n-days` | Whole days up to yesterday 23:59:59: **today is not included** |
+| `last-n-weeks`, `last-week` | Whole weeks (Sunday to Saturday) before the current week |
+| `last-n-hours` | Whole hours up to the end of the last full hour |
+| `custom` | `start` to `end`, to the minute. An absolute `end` is included only up to `hh:mm:00` |
+
+For "the last 24 hours" up to now, use `period='custom', start='-24h'`. The tool turns relative times into
+FortiAnalyzer clock times, rounding the start down and the end up to the minute. Each result includes the
+`window` that was covered, for example
+`{"start": "2026-10-14 17:02:00", "end": "2026-10-15 17:03:00", "tz": "Europe/Amsterdam"}`.
 
 Example query:
 
@@ -148,6 +168,7 @@ python fazsql.py --period 7d 'select ipstr(srcip) as requester, count(*) as n fr
 python fazsql.py --list-types --dev fortigate
 python fazsql.py --columns dns
 python fazsql.py --format csv --period today 'select ...'
+python fazsql.py --period custom --start=-24h 'select ...'   # relative times need --start=
 ```
 
 Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--timeout SECONDS` as needed.
@@ -163,6 +184,9 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
   log-type list. Pass `dev='fortisandbox', log='event'` and write `FROM $log-malware` in the SQL: the
   macro decides which table is read.
 - **Dates.** `toDate()` and `dtime` come back as Unix epoch numbers; wrap them in `toString()`.
+- **Time zones.** `$flex_timescale()` and `from_itime()` show FortiAnalyzer time, but `toString(itime)`,
+  `toDate(itime)` and `toHour(itime)` give UTC. `dtime` is each device's own clock, which can be hours
+  apart between devices.
 - **Passwords.** The `.env` file holds the password in plain text: keep it git-ignored and readable only
   by you. Avoid `claude mcp add --env FAZ_PASSWORD=...`, which stores it in your Claude configuration
   instead. Use a dedicated account with minimal rights.
