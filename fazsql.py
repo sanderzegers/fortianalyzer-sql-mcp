@@ -13,8 +13,9 @@ Flow: POST /cgi-bin/module/flatui_auth (login, sets CURRENT_SESSION + HTTP_CSRF_
 
 Backend limits (observed): a fetch returns at most 100 rows (flagged `truncated`), results
 are single-shot (the request id is freed after the first successful fetch), and an explicit
-SQL LIMIT does not raise the cap. Use GROUP BY / ORDER BY / LIMIT to get what you need in
-one page rather than paging.
+SQL LIMIT does not raise the cap. The backend counts the full result up to 1000 rows
+(`total_rows`). Use GROUP BY / ORDER BY / LIMIT to get what you need in one page; if you
+need more rows, page with a stable ORDER BY plus LIMIT 100 OFFSET 100, 200, ...
 
 Configuration (environment, or a .env file next to this script; FAZ_ENV_FILE points to
 another file, e.g. one per ADOM. Real environment variables take precedence):
@@ -86,6 +87,7 @@ def load_env_file(path=None):
 load_env_file()
 
 ROW_CAP = 100  # rows per fetch the backend returns, regardless of SQL LIMIT
+TOTAL_CAP = 1000  # the backend counts result rows up to this many (`total_row`)
 
 # dev-type numbers (same as the documented API's `devtype`)
 DEVTYPES = {
@@ -521,14 +523,16 @@ class FazSql:
 
     def query(self, sql, dev='fortigate', log=None, period='7d', last_n=0,
               start='', end='', timeout=120, poll=1.0, read_only=True, lock=None, cancelled=None):
-        """Run one query and return {'headers','rows','truncated','window','adom','dev','log'}.
+        """Run one query and return {'headers','rows','truncated','total_rows','window','adom',
+        'dev','log'}, plus 'note' when truncated.
 
         dev/log accept names ('fortigate', 'dns') or numbers. When log is omitted it is taken
         from the first `$log-<type>` macro in the SQL (a bare `$log` falls back to traffic).
         period is a name from PERIODS; 'custom' needs start/end ('hh:mm YYYY/MM/DD' in the FAZ
         time zone, or relative: 'now', '-90m', '-24h', '-7d', '-2w'; end defaults to 'now'
         for a relative start), the last-n-* ones need last_n. At most ROW_CAP rows come back;
-        `truncated` is True when the cap was reached. `window` is the time range $filter
+        `truncated` is True when the result had more. `total_rows` is the size of the full
+        result, a lower bound when `total_rows_exact` is False. `window` is the time range $filter
         covered ({start, end, tz}), absent if it couldn't be read. lock/cancelled: see _execute.
         """
         args = self._prepare(sql, dev, log, period, last_n, start, end, read_only)
@@ -573,9 +577,27 @@ class FazSql:
                 return str(c)
         headers = [cell(c) for c in cells[0]] if cells else []
         rows = [[cell(c) for c in r] for r in cells[1:]]
-        return {'headers': headers, 'rows': rows,
-                'truncated': bool(detail.get('truncated')) or len(rows) >= ROW_CAP}
+        if 'truncated' in detail:
+            truncated = bool(detail['truncated'])
+        else:  # older firmware without the flag: exactly ROW_CAP rows may also be complete
+            truncated = len(rows) >= ROW_CAP
+        total = max(int(detail.get('total_row') or 0) - 1, len(rows))  # total_row counts the header
+        exact = not truncated or total < TOTAL_CAP
+        result = {'headers': headers, 'rows': rows, 'truncated': truncated,
+                  'total_rows': total, 'total_rows_exact': exact}
+        if truncated:
+            result['note'] = truncation_note(len(rows), total, exact)
+        return result
 
+
+def truncation_note(shown, total, exact):
+    """What a truncated result means and what to do next (shown to the model and on the CLI)."""
+    return ('Only %d of %s%d result rows came back (the backend cap, whatever the SQL LIMIT). '
+            'They are the first rows in the query\'s order, arbitrary without ORDER BY: do not '
+            'count them or conclude that a value is missing from them. Instead: count(*) or '
+            'GROUP BY to aggregate; ORDER BY ... LIMIT for a top N; narrow the period or filter; '
+            'or page with a stable ORDER BY (add a tiebreak column) plus LIMIT %d OFFSET %d, '
+            '%d, ...' % (shown, '' if exact else 'at least ', total, ROW_CAP, ROW_CAP, 2 * ROW_CAP))
 
 def _print(result, fmt):
     h, rows = result['headers'], result['rows']
@@ -590,7 +612,10 @@ def _print(result, fmt):
         for r in rows:
             print('\t'.join(r))
     w = result.get('window')
-    note = '(%d rows%s%s%s)' % (len(rows), ', truncated at %d - add GROUP BY/filters' % ROW_CAP
+    if result['truncated']:
+        print(result['note'], file=sys.stderr)
+    note = '(%d rows%s%s%s)' % (len(rows), ' of %s%d' % ('' if result['total_rows_exact']
+                                                         else 'at least ', result['total_rows'])
                                 if result['truncated'] else '',
                                 ', ADOM %s' % result['adom'] if result.get('adom') else '',
                                 ', %s - %s %s' % (w['start'], w['end'], w['tz']) if w else '')
