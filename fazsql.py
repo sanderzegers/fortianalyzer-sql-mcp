@@ -128,6 +128,20 @@ _LAST_N_PERIOD = {'h': 'last-n-hours', 'd': 'last-n-days', 'w': 'last-n-weeks'}
 _RELATIVE = re.compile(r'^(?:now|-(\d+)([mhdw]))$')
 _UNIT_SECONDS = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
 _ABSOLUTE = re.compile(r'^\d{1,2}:\d{2} \d{4}/\d{1,2}/\d{1,2}$')
+# Other ways models write absolute times: '2026/10/14 00:00', '2026-10-14 00:00:00',
+# '2026-10-14T00:00', or a bare date (start of day, or end of day for `end`)
+_DATE_FIRST = re.compile(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::\d{2})?)?$')
+
+
+def normalize_custom_time(value, is_end=False):
+    """Turn date-first spellings into FAZ's 'hh:mm YYYY/MM/DD'; other values unchanged."""
+    m = _DATE_FIRST.match(value)
+    if not m:
+        return value
+    y, mo, d, hh, mm = m.groups()
+    if hh is None:
+        hh, mm = ('23', '59') if is_end else ('00', '00')
+    return '%02d:%s %s/%02d/%02d' % (int(hh), mm, y, int(mo), int(d))
 
 # `$log-<name>` macros whose name differs from the log type id
 MACRO_ALIASES = {'ips': 'attack'}
@@ -291,11 +305,22 @@ _ERROR_HINTS = (
 )
 
 
+_AGGREGATE = re.compile(
+    r'(count|sum|avg|min|max|any|anyLast|uniq\w*|groupArray\w*|groupUniqArray\w*|quantile\w*|'
+    r'median\w*|argMin|argMax|topK\w*|stddev\w*|var\w*)(If)?\(', re.I)
+
+
 def sql_error_hint(error, sql):
     """A short fix for a known FAZ SQL error, or '' (appended to the error for the caller)."""
     m = re.search(r'Column `?(\w+)`? is not under aggregate function', error)
     if m:
         name = m.group(1)
+        have = re.search(r"Have columns: \[(.*?)\]:", error)
+        keys = re.findall(r"'((?:[^'\\]|\\.)*)'", have.group(1)) if have else None
+        if keys is not None and all(_AGGREGATE.match(k) for k in keys):
+            return ('\nhint: this query level aggregates (%s) but has no GROUP BY, so `%s` and '
+                    'every other plain column fail. Add GROUP BY for the plain columns, or move '
+                    'the aggregate to the outer query' % (', '.join(keys) or 'count()', name))
         if re.search(r'\bAS\s+`?%s`?\b' % re.escape(name), sql, re.I):
             return ('\nhint: `%s` is your alias and also a real column of this table; GROUP BY, '
                     'ORDER BY and HAVING take the column. Rename the alias (e.g. %s_n)' % (name, name))
@@ -605,7 +630,8 @@ class FazSql:
             raise FazError("last_n only works with last-n-hours, last-n-days and last-n-weeks; for "
                            "the last %d days use period='%dd' (or period='last-n-days', last_n=%d)"
                            % (last_n, last_n, last_n))
-        start, end = start.strip().lower(), end.strip().lower()
+        start = normalize_custom_time(start.strip().lower())
+        end = normalize_custom_time(end.strip().lower(), is_end=True)
         if period_n == PERIOD_CUSTOM:
             for v in (start, end):
                 if v and not (_RELATIVE.match(v) or _ABSOLUTE.match(v)):
@@ -723,8 +749,14 @@ class FazSql:
             truncated = bool(detail['truncated'])
         else:  # older firmware without the flag: exactly ROW_CAP rows may also be complete
             truncated = len(rows) >= ROW_CAP
-        total = max(int(detail.get('total_row') or 0) - 1, len(rows))  # total_row counts the header
-        exact = not truncated or total < TOTAL_CAP
+        try:
+            total_row = int(detail.get('total_row') or 0)
+        except (TypeError, ValueError):
+            total_row = 0
+        total = max(total_row - 1, len(rows))  # total_row counts the header
+        # For plain row queries the backend reports only the rows it delivered as total_row
+        # (seen: 101 for a day of traffic), so a truncated total is exact only when it is larger.
+        exact = not truncated or len(rows) < total < TOTAL_CAP
         result = {'headers': headers, 'rows': rows, 'truncated': truncated,
                   'total_rows': total, 'total_rows_exact': exact}
         if truncated:
@@ -734,12 +766,19 @@ class FazSql:
 
 def truncation_note(shown, total, exact):
     """What a truncated result means and what to do next (shown to the model and on the CLI)."""
-    return ('Only %d of %s%d result rows came back (the backend cap, whatever the SQL LIMIT). '
+    if exact:
+        size = 'Only %d of %d result rows came back' % (shown, total)
+    elif total > shown:
+        size = 'Only %d of at least %d result rows came back' % (shown, total)
+    else:
+        size = ('Only the first %d result rows came back; the full result is larger and its size '
+                'is unknown (total_rows is not the number of matching logs)' % shown)
+    return (size + ' (the backend cap, whatever the SQL LIMIT). '
             'They are the first rows in the query\'s order, arbitrary without ORDER BY: do not '
             'count them or conclude that a value is missing from them. Instead: count(*) or '
             'GROUP BY to aggregate; ORDER BY ... LIMIT for a top N; narrow the period or filter; '
             'or page with a stable ORDER BY (add a tiebreak column) plus LIMIT %d OFFSET %d, '
-            '%d, ...' % (shown, '' if exact else 'at least ', total, ROW_CAP, ROW_CAP, 2 * ROW_CAP))
+            '%d, ...' % (ROW_CAP, ROW_CAP, 2 * ROW_CAP))
 
 def _print(result, fmt):
     h, rows = result['headers'], result['rows']
@@ -756,9 +795,10 @@ def _print(result, fmt):
     w = result.get('window')
     if result['truncated']:
         print(result['note'], file=sys.stderr)
-    note = '(%d rows%s%s%s)' % (len(rows), ' of %s%d' % ('' if result['total_rows_exact']
-                                                         else 'at least ', result['total_rows'])
-                                if result['truncated'] else '',
+    total = result['total_rows']
+    of = ('' if not result['truncated'] else ' of %d' % total if result['total_rows_exact']
+          else ' of at least %d' % total if total > len(rows) else ' of more')
+    note = '(%d rows%s%s%s)' % (len(rows), of,
                                 ', ADOM %s' % result['adom'] if result.get('adom') else '',
                                 ', %s - %s %s' % (w['start'], w['end'], w['tz']) if w else '')
     print(note, file=sys.stderr)
