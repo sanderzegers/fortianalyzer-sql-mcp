@@ -16,8 +16,12 @@ install on the FortiAnalyzer and no SSH access is needed.
   `window` is the time range the query covered, in the FortiAnalyzer's time zone. `total_rows` is the
   size of the full result; a truncated result also carries a `note` on what to do next
 - `faz_query_status` / `faz_query_cancel`: follow or stop a long-running query. `faz_query` runs
-  queries as background jobs and waits up to `wait` seconds (default 60). If the query is still running
-  it returns `{status: "running", job_id}` instead of blocking, and the other tools stay usable
+  queries as background jobs and waits up to `wait` seconds (default and maximum 45, below the usual
+  60-second MCP client timeout). If the query is still running or queued it returns
+  `{status: "running", job_id}` instead of blocking, and the other tools stay usable
+- Catches mistakes before they reach the FortiAnalyzer: a `$log` query without `$filter` (which would scan
+  every stored log) and `$filter AND a OR b` (which escapes the period) are rejected with the fix. Known
+  FortiAnalyzer SQL errors come back with a `hint:` line, written for models that use the tool
 - `faz_columns`: list the columns of a log type (read from one real log row)
 - `faz_list_types`: list which log types exist per device type on your FortiAnalyzer
 - Device and log types by **name** (`fortigate`, `dns`, ...) or number, checked against what your FortiAnalyzer offers
@@ -98,7 +102,9 @@ named by `FAZ_ENV_FILE`). Variables set in the real environment take precedence 
 | `FAZ_INSECURE` | `1` disables TLS verification (self-signed lab certificates) |
 | `FAZ_IDLE_LOGOUT` | Seconds of inactivity before the session is closed. Default `300`, `0` = never |
 | `FAZ_JOB_TIMEOUT` | Seconds before a running query is cancelled. Default `1800` |
-| `FAZ_MAX_JOBS` | Queries allowed to run at the same time. Default `2` |
+| `FAZ_MAX_JOBS` | Queries allowed to run at the same time; further ones wait in a queue. Default `2` |
+| `FAZ_MAX_QUEUED` | Queued queries before new ones are rejected. Default `8` |
+| `FAZ_MAX_WAIT` | Longest `wait` a call blocks for, in seconds. Keep it below your MCP client's request timeout. Default `45` |
 
 TLS verification is on by default.
 
@@ -125,10 +131,10 @@ last 7 days, and what did the top one look up?"*. Claude writes the query with t
 
 | Argument | Description |
 |---|---|
-| `sql` | The query. Use `$log-<type>` as the table and `$filter` in `WHERE` |
+| `sql` | The query. Use `$log-<type>` as the table and `$filter` in `WHERE`. A `$log` query without `$filter` is rejected; add `/*no-filter*/` to scan without it on purpose |
 | `dev` | Device type: `fortigate` (default), `fortiproxy`, `fortiweb`, `fortimail`, ... |
 | `log` | Log type: `traffic`, `dns`, `attack`, `webfilter`, `event`, ... Optional, taken from the `$log-<type>` macro |
-| `period` | `today`, `yesterday`, `7d` (default), `14d`, `30d`, `this-week`, `last-week`, `this-month`, `last-month`, `this-quarter`, `last-quarter`, `this-year`, `last-n-hours` / `last-n-days` / `last-n-weeks` (with `last_n`), or `custom` (with `start` and `end`) |
+| `period` | `today`, `yesterday`, `7d` (default), `14d`, `30d`, `this-week`, `last-week`, `this-month`, `last-month`, `this-quarter`, `last-quarter`, `this-year`, `last-n-hours` / `last-n-days` / `last-n-weeks` (with `last_n`), or `custom` (with `start` and `end`). `<N>h`, `<N>d` and `<N>w` (such as `90d`) and spellings like `last-3-days` mean the matching `last-n-*` period. `last_n` with any other period is an error |
 | `start`, `end` | For `custom`: `hh:mm YYYY/MM/DD` in the FortiAnalyzer's time zone, or relative to its clock: `now`, `-90m`, `-24h`, `-7d`, `-2w`. With a relative `start`, `end` defaults to `now` |
 
 ### Time periods
@@ -183,11 +189,14 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
   counts the full result up to 1000 rows (`total_rows`, with `total_rows_exact: false` beyond that).
   `truncated` is true only when rows were left out. Aggregate with `GROUP BY`, take a top N with
   `ORDER BY ... LIMIT`, or page with a stable `ORDER BY` plus `LIMIT 100 OFFSET 100`, `200`, ...
-- **Concurrency.** At most `FAZ_MAX_JOBS` queries (default 2) run at once per server instance; a further
-  one is rejected until one finishes. Long queries continue in the background (`faz_query_status`).
-- **Log types without a name in the tool.** FortiSandbox `malware` and `netalert` aren't in the tool's
-  log-type list. Pass `dev='fortisandbox', log='event'` and write `FROM $log-malware` in the SQL: the
-  macro decides which table is read.
+- **Concurrency.** At most `FAZ_MAX_JOBS` queries (default 2) run at once per server instance; further
+  ones wait in a queue of up to `FAZ_MAX_QUEUED`. Long queries continue in the background
+  (`faz_query_status`). If the client cancels a `faz_query` call before it returns, for example on its own
+  timeout, the query is cancelled too, since the caller never received the job id.
+- **Log types without a name in the tool.** FortiSandbox `malware` and `netalert` aren't in the
+  FortiAnalyzer's log-type list. Write `FROM $log-malware` with `dev='fortisandbox'` and leave `log`
+  empty; the tool sends a log type the device accepts and the macro decides which table is read.
+  `faz_columns` accepts them too.
 - **Dates.** `toDate()` and `dtime` come back as Unix epoch numbers; wrap them in `toString()`.
 - **Time zones.** `$flex_timescale()` and `from_itime()` show FortiAnalyzer time, but `toString(itime)`,
   `toDate(itime)` and `toHour(itime)` give UTC. `dtime` is each device's own clock, which can be hours
@@ -205,6 +214,7 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
 | Query returns 0 rows | Check the period and the ADOM. `$filter` limits the query to the selected period and ADOM |
 | `sql error: ... Missing columns` | The column does not exist for that log type. Check `faz_columns` |
 | `SQL query is forbidden.` | The FortiAnalyzer's own SQL filter rejected the statement (for example `version()`) |
+| `not configured: set FAZ_HOST and FAZ_USER ...` | This server instance has no env file or an incomplete one. Check `FAZ_ENV_FILE` |
 
 ## License
 
