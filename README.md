@@ -12,8 +12,9 @@ install on the FortiAnalyzer and no SSH access is needed.
 
 ## Features
 
-- `faz_query`: run one query and get `{headers, rows, truncated, window, adom, dev, log}` back. `window`
-  is the time range the query covered, in the FortiAnalyzer's time zone
+- `faz_query`: run one query and get `{headers, rows, truncated, total_rows, window, adom, dev, log}` back.
+  `window` is the time range the query covered, in the FortiAnalyzer's time zone. `total_rows` is the
+  size of the full result; a truncated result also carries a `note` on what to do next
 - `faz_query_status` / `faz_query_cancel`: follow or stop a long-running query. `faz_query` runs
   queries as background jobs and waits up to `wait` seconds (default and maximum 45, below the usual
   60-second MCP client timeout). If the query is still running or queued it returns
@@ -184,6 +185,10 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
 - **Server-side limits.** The FortiAnalyzer SQL dialect only allows read queries and rejects write or
   unsafe statements itself. The tool additionally refuses anything but a single `SELECT` / `WITH` before
   sending it.
+- **Row cap.** The backend returns at most 100 rows per query, whatever the SQL `LIMIT` says, and
+  counts the full result up to 1000 rows (`total_rows`, with `total_rows_exact: false` beyond that).
+  `truncated` is true only when rows were left out. Aggregate with `GROUP BY`, take a top N with
+  `ORDER BY ... LIMIT`, or page with a stable `ORDER BY` plus `LIMIT 100 OFFSET 100`, `200`, ...
 - **Concurrency.** At most `FAZ_MAX_JOBS` queries (default 2) run at once per server instance; further
   ones wait in a queue of up to `FAZ_MAX_QUEUED`. Long queries continue in the background
   (`faz_query_status`). If the client cancels a `faz_query` call before it returns, for example on its own
