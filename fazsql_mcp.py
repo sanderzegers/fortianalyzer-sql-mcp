@@ -13,7 +13,9 @@ and on exit. One server instance works in one FAZ and one ADOM; register it once
 Queries run as background jobs: faz_query waits up to `wait` seconds and, if the query is still
 running, returns a job_id to follow with faz_query_status / faz_query_cancel. Other tools stay
 usable meanwhile. Optional env: FAZ_JOB_TIMEOUT (seconds before a job is cancelled; default 1800),
-FAZ_MAX_JOBS (concurrent running jobs; default 2).
+FAZ_MAX_JOBS (concurrent running jobs; default 2; further queries wait in a queue),
+FAZ_MAX_QUEUED (queued jobs before new ones are rejected; default 8), FAZ_MAX_WAIT (cap on
+`wait`, kept below the MCP client's request timeout; default 45).
 """
 import asyncio
 import atexit
@@ -33,14 +35,17 @@ server = MCPServer(
     instructions=(
         'Read-only SQL against a FortiAnalyzer log database. Write queries in the FortiAnalyzer '
         'dataset dialect: FROM $log-<type> (e.g. $log-dns, $log-traffic) WHERE $filter ... If a '
-        'skill for FortiAnalyzer dataset queries (faz-dataset) is available, use it to write the '
-        'SQL and use faz_query to test it with a short period and a small LIMIT. faz_list_types '
-        'shows which log types exist per device type; faz_columns lists the columns of a log type. '
-        'Results are capped at 100 rows.'))
+        'skill for FortiAnalyzer dataset queries (faz-dataset) is available, read it before the '
+        'first query: SKILL.md, faz-sql-reference.md and the file for the device type; read them '
+        'again if your context was compacted. Use faz_query to test with a short period and a '
+        'small LIMIT. faz_list_types shows which log types exist per device type; faz_columns '
+        'lists the columns of a log type. Results are capped at 100 rows.'))
 
 IDLE_LOGOUT = int(os.environ.get('FAZ_IDLE_LOGOUT', '300'))
 JOB_TIMEOUT = int(os.environ.get('FAZ_JOB_TIMEOUT', '1800'))
 MAX_JOBS = int(os.environ.get('FAZ_MAX_JOBS', '2'))
+MAX_QUEUED = int(os.environ.get('FAZ_MAX_QUEUED', '8'))
+MAX_WAIT = int(os.environ.get('FAZ_MAX_WAIT', '45'))  # stay below the client's request timeout
 JOB_KEEP = 900  # seconds a finished job stays retrievable
 
 _lock = threading.RLock()  # guards the shared session; held per HTTP step, not per query
@@ -52,7 +57,12 @@ _adom_oids = {}  # name -> oid discovered so far; survives idle logouts
 def _session():
     global _faz
     if _faz is None:
-        faz = fazsql.FazSql()  # reads FAZ_* from the environment
+        try:
+            faz = fazsql.FazSql()  # reads FAZ_* from the environment
+        except fazsql.FazError as e:
+            raise fazsql.FazError('%s. This FortiAnalyzer server is not usable until the user '
+                                  'configures it: use another FortiAnalyzer server if one is '
+                                  'available, and do not look for credentials yourself' % e) from e
         faz._adom_oids = _adom_oids
         faz.login()
         _faz = faz
@@ -75,7 +85,7 @@ def _idle_watch():
     while True:
         time.sleep(15)
         with _lock:  # waits for a running query
-            if (_faz is not None and not _running_jobs()
+            if (_faz is not None and not _active_jobs()
                     and time.monotonic() - _last_used > IDLE_LOGOUT):
                 _close()
 
@@ -91,7 +101,7 @@ class _Job:
         self.sql = sql
         self.started = time.monotonic()
         self.finished = None
-        self.state = 'running'  # running | done | error | cancelled
+        self.state = 'queued'  # queued | running | done | error | cancelled
         self.result = None
         self.error = None
         self.cancel = threading.Event()
@@ -103,20 +113,36 @@ class _Job:
 
 _jobs = {}
 _jobs_lock = threading.Lock()
+_slots = threading.BoundedSemaphore(MAX_JOBS)  # one per query running on the FAZ
 
 
-def _running_jobs():
+def _active_jobs():
     with _jobs_lock:
-        return sum(1 for j in _jobs.values() if j.state == 'running')
+        return sum(1 for j in _jobs.values() if j.state in ('queued', 'running'))
 
 
-def _job_worker(job, kwargs):
+def _prepare(**kwargs):
+    """Validate a query before it is queued, so mistakes come back at once."""
+    with _lock:
+        try:
+            return _session()._prepare(read_only=True, **kwargs)
+        finally:
+            _touch()
+
+
+def _job_worker(job, args):
     try:
-        with _lock:
-            faz = _session()
-            args = faz._prepare(read_only=True, **kwargs)
-        result = faz.run_prepared(args, JOB_TIMEOUT, lock=_lock, cancelled=job.cancel)
-        job.result, job.state = result, 'done'
+        while not _slots.acquire(timeout=1):  # queued: wait for a free slot
+            if job.cancel.is_set():
+                raise fazsql.FazCancelled('query cancelled')
+        try:
+            job.state = 'running'
+            with _lock:
+                faz = _session()
+            result = faz.run_prepared(args, JOB_TIMEOUT, lock=_lock, cancelled=job.cancel)
+            job.result, job.state = result, 'done'
+        finally:
+            _slots.release()
     except fazsql.FazCancelled:
         job.state = 'cancelled'
     except fazsql.FazError as e:
@@ -129,18 +155,18 @@ def _job_worker(job, kwargs):
         job.done.set()
 
 
-def _submit(sql, **kwargs):
+def _submit(sql, args):
     with _jobs_lock:
         now = time.monotonic()
         for jid in [k for k, j in _jobs.items() if j.finished and now - j.finished > JOB_KEEP]:
             del _jobs[jid]
-        running = sum(1 for j in _jobs.values() if j.state == 'running')
-        if running >= MAX_JOBS:
-            raise fazsql.FazError('%d queries are already running; wait for them (faz_query_status) '
-                                  'or cancel one (faz_query_cancel)' % running)
+        active = sum(1 for j in _jobs.values() if j.state in ('queued', 'running'))
+        if active >= MAX_JOBS + MAX_QUEUED:
+            raise fazsql.FazError('%d queries are already running or queued; wait for them '
+                                  '(faz_query_status) or cancel one (faz_query_cancel)' % active)
         job = _Job(sql)
         _jobs[job.id] = job
-    threading.Thread(target=_job_worker, args=(job, dict(sql=sql, **kwargs)), daemon=True,
+    threading.Thread(target=_job_worker, args=(job, args), daemon=True,
                      name='faz-job-' + job.id).start()
     return job
 
@@ -162,11 +188,14 @@ def _report(job):
         raise fazsql.FazError(job.error)
     if job.state == 'cancelled':
         return {'status': 'cancelled', 'job_id': job.id}
-    return {'status': 'running', 'job_id': job.id, 'elapsed_seconds': job.elapsed(),
-            'hint': 'call faz_query_status(job_id) to wait for the result'}
+    return {'status': job.state, 'job_id': job.id, 'elapsed_seconds': job.elapsed(),
+            'hint': 'call faz_query_status(job_id) to wait for the result'
+                    + (' (queued: %d queries are already running)' % MAX_JOBS
+                       if job.state == 'queued' else '')}
 
 
 async def _wait_report(job, wait):
+    wait = min(wait, MAX_WAIT)  # return before the MCP client gives up on the request
     if wait > 0:
         await asyncio.to_thread(job.done.wait, wait)
     return _report(job)
@@ -196,18 +225,26 @@ def _run_columns(log, dev, period):
                                          idempotentHint=True, openWorldHint=False))
 async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
                     period: str = '7d', last_n: int = 0, start: str = '', end: str = '',
-                    wait: int = 60) -> dict:
+                    wait: int = 45) -> dict:
     """Run one read-only SELECT/WITH query against the FortiAnalyzer log database.
 
+    Before your first query, read the faz-dataset skill if you have it (SKILL.md,
+    faz-sql-reference.md and the file for the device type), and again after a context
+    compaction. Its column names and pitfalls differ from plain SQL and ClickHouse.
+
     Write the query like a FortiAnalyzer dataset: FROM $log-<type> (e.g. $log-dns, $log-traffic,
-    $log-attack, $log-webfilter) WHERE $filter ... $filter adds the time range of `period`.
+    $log-attack, $log-webfilter) WHERE $filter ... $filter adds the time range of `period`; a
+    query on a $log table without it is rejected. Put ORs next to it in parentheses:
+    WHERE $filter AND (a OR b). Filter aggregates with HAVING, compare IPs as ipstr(srcip) =
+    '10.1.2.3', and don't give an alias the name of a real column (AS total, AS itime).
     `log` is optional: it is taken from the first $log-<type> macro in the SQL (a bare $log needs
-    it, default traffic). `dev` is the device type (fortigate, fortiproxy, fortiweb, ...); an
+    it, default traffic). `dev` is the device type (fortigate, fortimail, fortiweb, ...); an
     invalid dev/log combination is rejected, so call faz_list_types if unsure.
 
     period: today, yesterday, this-week, last-week, 7d, 14d, 30d, this-month, last-month,
-    this-quarter, last-quarter, this-year, last-n-hours / last-n-days / last-n-weeks (needs
-    last_n >= 1), or custom (needs start; end defaults to 'now' for a relative start).
+    this-quarter, last-quarter, this-year, '<N>h' / '<N>d' / '<N>w' (e.g. '90d', same as
+    last-n-days with last_n=90), or custom (needs start; end defaults to 'now' for a relative
+    start). last_n is only used with the last-n-* periods.
     All periods are in the FAZ's time zone. 7d, 14d, 30d and last-n-days are whole days ending
     yesterday 23:59:59, so they EXCLUDE TODAY; last-n-hours ends at the last full hour;
     last-n-weeks is whole Sunday-Saturday weeks before this one. today/this-* run up to now. For
@@ -227,36 +264,44 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     is cumulative and inflates totals.
 
     Long queries: the query runs as a background job and this call waits up to `wait` seconds
-    (0 = return at once). If it is not finished by then, it returns {status: "running", job_id,
-    elapsed_seconds} and keeps running: follow it with faz_query_status(job_id) instead of
-    submitting the query again, or stop it with faz_query_cancel(job_id). Tell the user a
-    long query is in progress; a shorter period or tighter filter usually finishes faster.
-    At most FAZ_MAX_JOBS queries (default 2) run at once; a further one is rejected until one
-    finishes.
+    (0 = return at once, at most FAZ_MAX_WAIT, default 45). If it is not finished by then, it
+    returns {status: "running" or "queued", job_id, elapsed_seconds} and keeps going: follow it
+    with faz_query_status(job_id) instead of submitting the query again, or stop it with
+    faz_query_cancel(job_id). Tell the user a long query is in progress; a shorter period or
+    tighter filter usually finishes faster. At most FAZ_MAX_JOBS queries (default 2) run at
+    once; further ones wait in a queue, so run queries one after another when you can.
 
-    Log types this tool doesn't list by name, such as FortiSandbox `malware` and `netalert`:
-    pass a log type it accepts for that device (dev='fortisandbox', log='event') and keep
-    FROM $log-malware in the SQL; the macro decides the table. Dates from toDate() and dtime
-    come back as Unix epoch numbers; wrap them in toString() for readable dates.
+    FortiSandbox `malware` and `netalert`: write FROM $log-malware / $log-netalert with
+    dev='fortisandbox'; leave `log` empty. Dates from toDate() and dtime come back as Unix
+    epoch numbers; wrap them in toString() for readable dates.
 
+    Errors from the FortiAnalyzer often end with a `hint:` line: apply it before retrying.
     Returns {status: "done", headers, rows, truncated, window, adom, dev, log, job_id}; `adom`
     is the ADOM that was queried.
     """
     try:
-        job = _submit(sql, dev=dev, log=log or None, period=period, last_n=last_n,
-                      start=start, end=end)
-        return await _wait_report(job, wait)
+        args = await asyncio.to_thread(_prepare, sql=sql, dev=dev, log=log or None, period=period,
+                                       last_n=last_n, start=start, end=end)
+        job = _submit(sql, args)
     except fazsql.FazError as e:  # anticipated failure: let the model read the reason
+        raise ToolError(str(e)) from e
+    try:
+        return await _wait_report(job, wait)
+    except asyncio.CancelledError:
+        job.cancel.set()  # the client gave up before it saw the job_id: free the FAZ
+        raise
+    except fazsql.FazError as e:
         raise ToolError(str(e)) from e
 
 
 @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
                                          idempotentHint=True, openWorldHint=False))
 async def faz_query_status(job_id: str, wait: int = 30) -> dict:
-    """Check a query started by faz_query that returned status "running".
+    """Check a query started by faz_query that returned status "running" or "queued".
 
-    Waits up to `wait` seconds for it to finish (0 = check at once). Returns the same result as
-    faz_query when done, {status: "running", elapsed_seconds} while it runs, or
+    Waits up to `wait` seconds for it to finish (0 = check at once, at most FAZ_MAX_WAIT).
+    Returns the same result as faz_query when done, {status: "running" or "queued",
+    elapsed_seconds} while it runs or waits for a slot, or
     {status: "cancelled"}; a failed query raises its error. A finished job can be read again
     for 15 minutes.
     """
@@ -286,8 +331,10 @@ async def faz_columns(log: str, dev: str = 'fortigate', period: str = '7d') -> d
 
     Reads one real row, so it needs at least one log of that type in `period` (try a longer
     period if it reports none). `SELECT *` hides ALIAS columns: if a column you expect is
-    missing, confirm by selecting it directly in faz_query. Use this for log types that have no
-    column reference (FortiMail, FortiWeb, FortiProxy, ...).
+    missing, confirm by selecting it directly in faz_query. If the faz-dataset skill is
+    available, its column files also give types and meanings; use this tool for log types it
+    doesn't cover (FortiProxy, ...) and to confirm. FortiSandbox: log='malware' or 'netalert'
+    with dev='fortisandbox' work here too. `period` takes the same values as in faz_query.
 
     Returns {adom, log, columns}.
     """
@@ -303,8 +350,10 @@ async def faz_list_types(dev: str = '') -> dict:
     """List the log types this FortiAnalyzer offers per device type, with their numbers.
 
     Pass dev (name such as fortigate, or number) to show a single device type; leave it empty
-    for all. Keys are dev-type numbers (0 FortiGate, 3 FortiClient, 5 FortiWeb, 15 FortiProxy,
-    20 FortiADC, 21 FortiFirewall, ...); values map log type name to number (null = unknown).
+    for all. Keys are dev-type numbers (0 FortiGate, 3 FortiClient, 4 FortiMail, 5 FortiWeb,
+    10 FortiSandbox, 15 FortiProxy, 20 FortiADC, 21 FortiFirewall, ...); values map log type
+    name to number (null = not a type the API takes by itself; FortiSandbox `malware` and
+    `netalert` still work as $log-malware / $log-netalert in faz_query).
     """
     try:
         return await asyncio.to_thread(_run_types, dev or None)

@@ -114,6 +114,14 @@ PERIODS = {
 }
 PERIOD_NEEDS_N = {2, 6, 12}
 PERIOD_CUSTOM = 16
+# Spellings of "the last N hours/days/weeks" that aren't period names: '90d', '12h', '3w',
+# 'last-3-days', 'last 3 weeks', 'last-n-days 3'. Names in PERIODS (7d, 14d, 30d, 2w) win.
+_LAST_N_SPELLINGS = (
+    re.compile(r'^(?P<n>\d+)(?P<unit>[hdw])$'),
+    re.compile(r'^last-(?P<n>\d+)-(?P<unit>hour|day|week)s?$'),
+    re.compile(r'^last-n-(?P<unit>hour|day|week)s?-(?P<n>\d+)$'),
+)
+_LAST_N_PERIOD = {'h': 'last-n-hours', 'd': 'last-n-days', 'w': 'last-n-weeks'}
 # custom start/end may be relative to the FAZ clock: 'now', '-90m', '-24h', '-7d', '-2w'
 _RELATIVE = re.compile(r'^(?:now|-(\d+)([mhdw]))$')
 _UNIT_SECONDS = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
@@ -122,15 +130,33 @@ _ABSOLUTE = re.compile(r'^\d{1,2}:\d{2} \d{4}/\d{1,2}/\d{1,2}$')
 # `$log-<name>` macros whose name differs from the log type id
 MACRO_ALIASES = {'ips': 'attack'}
 _LOG_MACRO = re.compile(r'\$log-([a-z][a-z0-9-]*)')
+# Tables with a `$log-<name>` macro that the log-type list doesn't name (FortiSandbox). The API
+# still needs a log type the device offers; the macro in the SQL picks the table.
+UNLISTED_LOGS = {'malware', 'netalert'}
 
 
 def infer_log_type(sql):
     """Log type named by the first known `$log-<type>` macro in the SQL, else None."""
     for name in _LOG_MACRO.findall(sql):
         name = MACRO_ALIASES.get(name, name)
-        if name in LOGTYPES:
+        if name in LOGTYPES or name in UNLISTED_LOGS:
             return name
     return None
+
+
+def normalize_period(period, last_n):
+    """Turn '90d', '12h', 'last-3-weeks' and similar into (last-n-* period, N)."""
+    v = str(period).strip().lower().replace('_', '-').replace(' ', '-')
+    if isinstance(period, int) or v.isdigit() or v in PERIODS:
+        return period, last_n
+    for pattern in _LAST_N_SPELLINGS:
+        m = pattern.match(v)
+        if m:
+            n = int(m.group('n'))
+            if last_n and last_n != n:
+                raise FazError('period %r and last_n=%d disagree' % (period, last_n))
+            return _LAST_N_PERIOD[m.group('unit')[0]], n
+    return period, last_n
 
 
 _FORBIDDEN = re.compile(
@@ -180,6 +206,110 @@ def check_read_only(sql):
         raise FazError('keyword %r is not allowed in a read-only query' % m.group(0))
 
 
+_FILTER_TOKEN = re.compile(r'\(|\)|\$filter(?:-[a-z]+)?|[a-z_]\w*', re.I)
+_CONDITION_START = {'where', 'having', 'on', 'prewhere', 'when'}
+_CONDITION_END = {'group', 'order', 'having', 'limit', 'union', 'settings', 'then', 'window'}
+
+
+def check_filter(sql):
+    """Reject the two ways a query silently ignores the period: no $filter, or an OR beside it.
+
+    Write /*no-filter*/ in the SQL to scan $log tables without $filter on purpose.
+    """
+    body = _SQL_TOKEN.sub(_blank_token, sql)
+    if '$log' in body and '$filter' not in body and '/*no-filter*/' not in sql.replace(' ', ''):
+        raise FazError('the query reads a $log table without $filter, so `period` is not applied '
+                       'and it scans every stored log. Add $filter to the WHERE clause '
+                       '(WHERE $filter AND ...); to scan without it on purpose, add /*no-filter*/')
+    depth, tokens = 0, []
+    for m in _FILTER_TOKEN.finditer(body):
+        t = m.group(0).lower()
+        if t in (')', 'end'):  # CASE ... END nests like parentheses
+            depth -= 1
+        tokens.append((t, depth))
+        if t in ('(', 'case'):
+            depth += 1
+    for i, (t, d) in enumerate(tokens):
+        if not t.startswith('$filter'):
+            continue
+        j = i - 1  # back to the start of this condition, staying at the same nesting level
+        while j >= 0 and tokens[j][1] >= d and not (tokens[j][1] == d and tokens[j][0] in _CONDITION_START):
+            j -= 1
+        k = i + 1  # forward to its end
+        while k < len(tokens) and tokens[k][1] >= d and not (tokens[k][1] == d and tokens[k][0] in _CONDITION_END):
+            k += 1
+        if any(tok == 'or' and dd == d for tok, dd in tokens[j + 1:k]):
+            raise FazError('`$filter AND a OR b` reads as `($filter AND a) OR b`: rows matching b '
+                           'ignore the period, and the query scans every stored log. Put the OR '
+                           'in parentheses: WHERE $filter AND (a OR b)')
+
+
+# Fixes for FAZ / ClickHouse errors that models keep running into, appended to the error text.
+_FUNCTION_FIXES = {
+    'splitpart': "split_part(s, sep, n) or splitByString(sep, ifNull(s, ''))[n]",
+    'toutf8': 'nothing: strings are already UTF-8',
+    'uppercase': 'upper(s)', 'toupper': 'upper(s)', 'lowercase': 'lower(s)', 'tolower': 'lower(s)',
+    'from_unix_timestamp': 'from_itime(itime), or toDateTime(n) for other epoch numbers',
+    'from_unixtime': 'from_itime(itime), or toDateTime(n) for other epoch numbers',
+    'from_utc_time': 'from_itime(itime) (FAZ time zone) or toDateTime(itime) (UTC)',
+    'findstring': 'position(s, needle)',
+    'extractstring': "extract(s, 'regex(with group)')",
+    'doubleorzero': 'toFloat64OrZero(s)',
+    'roundquantiletiming': 'quantile(0.5)(x) or quantileExact(0.95)(x)',
+    'percentileexactweighted': 'quantileExact(0.95)(x)',
+}
+_ERROR_HINTS = (
+    (r'Aggregate function .* is found in WHERE',
+     'filter on aggregates with HAVING, or in an outer query'),
+    (r'is found inside another aggregate function',
+     'aggregate in an inner query and aggregate its alias outside (inner count(*) AS cnt, outer sum(cnt))'),
+    (r'Illegal type IPv6|types? IPv6',
+     "IP columns are IPv6 values: compare and LIKE on ipstr(col), e.g. ipstr(srcip) = '10.1.2.3'"),
+    (r'Illegal type String of argument of function (toHour|toDate|toStartOf|toDayOf)',
+     'from_itime() returns text; use toHour(toDateTime(itime, timezone())) or toDate(itime, timezone())'),
+    (r'Nested type Array\(String\) cannot be inside Nullable',
+     "wrap nullable strings in ifNull(col, '') before splitting them"),
+    (r'LowCardinality\(UInt8\) is not supported',
+     "cast the column first: CAST(ifNull(col, '') AS String)"),
+    (r'no supertype for types',
+     "both sides of a comparison or ifNull() need the same type: compare a number column with a "
+     "number, not ''. Numeric logid (FortiAuthenticator, FortiClient) can't be filtered in WHERE"),
+    (r'Missing columns:',
+     'the column does not exist in this table for this device type: list the columns with '
+     'faz_columns(log, dev) or read the skill column file. FortiMail, FortiWeb and FortiADC use '
+     'device_id and pri (not devid, level). An inner-query alias is only visible outside if the '
+     'inner query selects it'),
+    (r'Timeout exceeded',
+     "the FortiAnalyzer's own query time limit: use a shorter period, put the most selective "
+     'condition first and aggregate instead of returning rows'),
+    (r'SQL query is forbidden',
+     'the FortiAnalyzer refused the query text. A possible cause is a write keyword (delete, '
+     "rename, drop, ...) inside a string literal, e.g. LIKE '%Delete%': reword it "
+     "(lower(msg) LIKE '%delet%')"),
+)
+
+
+def sql_error_hint(error, sql):
+    """A short fix for a known FAZ SQL error, or '' (appended to the error for the caller)."""
+    m = re.search(r'Column `?(\w+)`? is not under aggregate function', error)
+    if m:
+        name = m.group(1)
+        if re.search(r'\bAS\s+`?%s`?\b' % re.escape(name), sql, re.I):
+            return ('\nhint: `%s` is your alias and also a real column of this table; GROUP BY, '
+                    'ORDER BY and HAVING take the column. Rename the alias (e.g. %s_n)' % (name, name))
+        return ('\nhint: every selected column must be aggregated or listed in GROUP BY. An alias '
+                'named like a real column (e.g. ... AS itime) also causes this')
+    m = re.search(r'Unknown function (\w+)', error)
+    if m:
+        fix = _FUNCTION_FIXES.get(m.group(1).lower())
+        return '\nhint: ' + ('use ' + fix if fix else "this FortiAnalyzer's ClickHouse has no such "
+                             "function; see the skill's faz-sql-reference.md")
+    for pattern, hint in _ERROR_HINTS:
+        if re.search(pattern, error):
+            return '\nhint: ' + hint
+    return ''
+
+
 class FazSql:
     def __init__(self, host=None, user=None, password=None, adom=None, adom_oid=None,
                  verify=None, ca_bundle=None):
@@ -193,7 +323,8 @@ class FazSql:
         self._adom_oids = {}      # ADOM name -> oid, filled by discovery (may be shared)
         self._relogin = False
         if not self.host or not self.user:
-            raise FazError('set FAZ_HOST and FAZ_USER (and FAZ_PASSWORD)')
+            raise FazError('not configured: set FAZ_HOST and FAZ_USER (and FAZ_PASSWORD) in the '
+                           'environment or the env file (FAZ_ENV_FILE, else .env next to fazsql.py)')
         if verify is None:
             verify = os.environ.get('FAZ_INSECURE', '') not in ('1', 'true', 'yes')
         ca_bundle = ca_bundle or os.environ.get('FAZ_CA_BUNDLE')
@@ -444,7 +575,8 @@ class FazSql:
                         continue
                     raise
                 if 'error' in j:
-                    raise FazError('sql error: ' + str(j['error'])[:400])
+                    error = str(j['error'])
+                    raise FazError('sql error: ' + error[:400] + sql_error_hint(error, sql))
                 if 'detail' in j:
                     return self._decode(j['detail'])
                 time.sleep(poll)  # still running
@@ -456,12 +588,21 @@ class FazSql:
         """Validate and resolve a query; returns the leading arguments of _execute."""
         if read_only:
             check_read_only(sql)
+            check_filter(sql)
         if log in (None, ''):
             log = infer_log_type(sql) or 'traffic'
+        if str(log).strip().lower() in UNLISTED_LOGS:
+            # FortiMail's $log-malware is its virus table; FortiSandbox runs its tables as event
+            log = 'virus' if _resolve(dev, DEVTYPES, 'device type') == DEVTYPES['fortimail'] else 'event'
         dev_n, log_n = self._types(dev, log)
+        period, last_n = normalize_period(period, last_n)
         period_n = _resolve(period, PERIODS, 'period')
         if period_n in PERIOD_NEEDS_N and last_n < 1:
             raise FazError('period %r needs last_n >= 1' % period)
+        if last_n and period_n not in PERIOD_NEEDS_N:
+            raise FazError("last_n only works with last-n-hours, last-n-days and last-n-weeks; for "
+                           "the last %d days use period='%dd' (or period='last-n-days', last_n=%d)"
+                           % (last_n, last_n, last_n))
         start, end = start.strip().lower(), end.strip().lower()
         if period_n == PERIOD_CUSTOM:
             for v in (start, end):
@@ -554,8 +695,9 @@ class FazSql:
         """
         names = {v: k for k, v in LOGTYPES.items()}
         name = names.get(log) if isinstance(log, int) else str(log).strip().lower()
-        if name not in LOGTYPES:
-            raise FazError('unknown log type %r (known: %s)' % (log, ', '.join(sorted(LOGTYPES))))
+        if name not in LOGTYPES and name not in UNLISTED_LOGS:
+            raise FazError('unknown log type %r (known: %s)'
+                           % (log, ', '.join(sorted(set(LOGTYPES) | UNLISTED_LOGS))))
         sql = ("select arrayStringConcat(JSONExtractKeys(formatRowNoNewline('JSONEachRow', *)), "
                "', ') as cols from (select * from $log-%s where $filter limit 1) t" % name)
         r = self.query(sql, dev=dev, log=name, period=period)
