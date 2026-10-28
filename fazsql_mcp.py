@@ -246,14 +246,14 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     this-quarter, last-quarter, this-year, '<N>h' / '<N>d' / '<N>w' (e.g. '90d', same as
     last-n-days with last_n=90), or custom (needs start; end defaults to 'now' for a relative
     start). last_n is only used with the last-n-* periods.
-    All periods are in the FAZ's time zone. 7d, 14d, 30d and last-n-days are whole days ending
-    yesterday 23:59:59, so they EXCLUDE TODAY; last-n-hours ends at the last full hour;
-    last-n-weeks is whole Sunday-Saturday weeks before this one. today/this-* run up to now. For
-    "the last 24 hours" or anything up to now, use period='custom', start='-24h' (relative:
-    'now', '-90m', '-24h', '-7d', '-2w'), or today. Absolute custom times are
-    'hh:mm YYYY/MM/DD' in FAZ time; the end is inclusive only up to hh:mm:00.
-    Every result has `window` {start, end, tz}: the range $filter covered. State it when you
-    report numbers. Times in SQL: $flex_timescale() and from_itime() show FAZ time, but
+    All periods are in the FAZ's time zone. Whether 7d, 14d, 30d and last-n-days end now or at
+    yesterday 23:59:59 has differed between queries (October 2026: 7d, 30d and last-n-days ran
+    up to now, one 14d query ended yesterday), and this-week started on Monday. So don't
+    describe a window from its name: every result has `window` {start, end, tz}, the range
+    $filter actually covered. Read it and state it when you report numbers. For an exact span,
+    use period='custom' with start/end: relative ('now', '-90m', '-24h', '-7d', '-2w') or
+    absolute in FAZ time ('hh:mm YYYY/MM/DD'; '2026-10-14 11:00' and a bare date also work).
+    The end is inclusive only up to hh:mm:00. Times in SQL: $flex_timescale() and from_itime() show FAZ time, but
     toString/toDate/toHour(itime) give UTC; dtime is each device's own clock, which can differ
     by hours between devices, so compare devices on itime.
 

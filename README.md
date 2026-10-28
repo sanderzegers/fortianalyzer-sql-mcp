@@ -139,16 +139,16 @@ last 7 days, and what did the top one look up?"*. Claude writes the query with t
 
 ### Time periods
 
-The periods are FortiAnalyzer's own report periods, in the FortiAnalyzer's time zone. Some of them stop
-before the current day or hour:
+The periods are FortiAnalyzer's own report periods, in the FortiAnalyzer's time zone. Where they end has
+differed between queries, so rely on the `window` each result returns rather than on the period's name:
 
 | Period | Covers |
 |---|---|
-| `today`, `this-week`, `this-month`, ... | From the start of the day, week, ... up to now. Weeks start on Sunday |
-| `7d`, `14d`, `30d`, `last-n-days` | Whole days up to yesterday 23:59:59: **today is not included** |
-| `last-n-weeks`, `last-week` | Whole weeks (Sunday to Saturday) before the current week |
+| `today`, `this-week`, `this-month`, ... | From the start of the day, week, ... up to now. `this-week` started on Monday on a FAZ 7.6 in October 2026 |
+| `7d`, `14d`, `30d`, `last-n-days` | Seen both ways: up to now (`7d`, `30d`, `last-n-days` on 28 Oct 2026) and whole days up to yesterday 23:59:59 (a `14d` query on 16 Oct 2026) |
+| `last-n-weeks`, `last-week` | Whole weeks before the current week |
 | `last-n-hours` | Whole hours up to the end of the last full hour |
-| `custom` | `start` to `end`, to the minute. An absolute `end` is included only up to `hh:mm:00` |
+| `custom` | `start` to `end`, to the minute. An absolute `end` is included only up to `hh:mm:00`. Besides `hh:mm YYYY/MM/DD`, the tool accepts `2026-10-14 11:00`, `2026/10/14 11:00` and a bare date (start or end of that day) |
 
 For "the last 24 hours" up to now, use `period='custom', start='-24h'`. The tool turns relative times into
 FortiAnalyzer clock times, rounding the start down and the end up to the minute. Each result includes the
