@@ -36,7 +36,8 @@ server = MCPServer(
         'skill for FortiAnalyzer dataset queries (faz-dataset) is available, use it to write the '
         'SQL and use faz_query to test it with a short period and a small LIMIT. faz_list_types '
         'shows which log types exist per device type; faz_columns lists the columns of a log type. '
-        'Results are capped at 100 rows.'))
+        'Results are capped at 100 rows; when a result is truncated, follow its `note` instead '
+        'of drawing conclusions from the partial rows.'))
 
 IDLE_LOGOUT = int(os.environ.get('FAZ_IDLE_LOGOUT', '300'))
 JOB_TIMEOUT = int(os.environ.get('FAZ_JOB_TIMEOUT', '1800'))
@@ -219,8 +220,12 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     toString/toDate/toHour(itime) give UTC; dtime is each device's own clock, which can differ
     by hours between devices, so compare devices on itime.
 
-    At most 100 rows are returned (`truncated` is true when the cap is hit), whatever the SQL
-    LIMIT says. Prefer GROUP BY, ORDER BY ... LIMIT and tight filters over raw rows; use a
+    At most 100 rows are returned, whatever the SQL LIMIT says. `total_rows` is the size of the
+    full result (a lower bound of 1000 when `total_rows_exact` is false). When `truncated` is
+    true, the rows are only the first 100 in the query's order (arbitrary without ORDER BY):
+    never count them or conclude a value is absent from them; follow the `note` in the result
+    (aggregate, top N, narrower period, or page with a stable ORDER BY plus LIMIT 100 OFFSET
+    100, 200, ...). Prefer GROUP BY, ORDER BY ... LIMIT and tight filters over raw rows; use a
     short period and a small LIMIT while developing a query. Only single SELECT/WITH
     statements are accepted (no CREATE/DROP/temp tables). hcache (###(...)###) works.
     Bytes: use coalesce(sentdelta,sentbyte,0) / coalesce(rcvddelta,rcvdbyte,0); sentbyte alone
@@ -239,8 +244,8 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     FROM $log-malware in the SQL; the macro decides the table. Dates from toDate() and dtime
     come back as Unix epoch numbers; wrap them in toString() for readable dates.
 
-    Returns {status: "done", headers, rows, truncated, window, adom, dev, log, job_id}; `adom`
-    is the ADOM that was queried.
+    Returns {status: "done", headers, rows, truncated, total_rows, total_rows_exact, window,
+    adom, dev, log, job_id}, plus `note` when truncated; `adom` is the ADOM that was queried.
     """
     try:
         job = _submit(sql, dev=dev, log=log or None, period=period, last_n=last_n,
