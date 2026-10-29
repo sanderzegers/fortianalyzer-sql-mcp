@@ -326,6 +326,17 @@ def sql_error_hint(error, sql):
                     'ORDER BY and HAVING take the column. Rename the alias (e.g. %s_n)' % (name, name))
         return ('\nhint: every selected column must be aggregated or listed in GROUP BY. An alias '
                 'named like a real column (e.g. ... AS itime) also causes this')
+    if 'SQL query is forbidden' in error:
+        body = _SQL_TOKEN.sub(_blank_token, sql)
+        m = re.search(r'\b\w*hash\w*(?=\s*\()', body, re.I)
+        if m:
+            return ('\nhint: the FortiAnalyzer rejects every function with "Hash" in its name (%s). '
+                    "Use CRC32 instead: toUInt64(CRC32(x)) * 4294967296 + CRC32(concat('#', x))"
+                    % m.group(0))
+        m = re.search(r'\b(endpoints?|endusers?)\b', body, re.I)
+        if m:
+            return ('\nhint: the FortiAnalyzer rejects the word %r in a query, also as an '
+                    'alias (... AS endpoints). Rename it (n_ep, n_eu)' % m.group(0))
     m = re.search(r'Unknown function (\w+)', error)
     if m:
         fix = _FUNCTION_FIXES.get(m.group(1).lower())
