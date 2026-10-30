@@ -212,7 +212,7 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
 | `ADOM '...' not found among the ADOMs this account can enter` | The ADOM name is wrong, has no registered devices, or the account has no access. Set `FAZ_ADOM_OID` |
 | `log type ... is not available for device type ...` | That device type has no such log type. Check `faz_list_types` |
 | Query returns 0 rows | Check the period and the ADOM. `$filter` limits the query to the selected period and ADOM |
-| `sql error: ... Missing columns` | The column does not exist for that log type. Check `faz_columns` |
+| `sql error: ... Missing columns` | The column does not exist for that log type. Check `faz_columns`. On the `$ADOM_*` tables (UEBA endpoints and users), `'itime'` means `$filter` was used: those tables have no `itime`. The error hint then lists their columns and the host-name lookup |
 | `SQL query is forbidden.` | The FortiAnalyzer's own SQL filter rejected the statement (for example `version()`). Seen triggers: any function with "Hash" in its name (`cityHash64`, `xxHash64`; use `CRC32`), the words `endpoints` / `endusers` even as an alias, and a write keyword inside a string literal. The error hint names the trigger it finds |
 | `not configured: set FAZ_HOST and FAZ_USER ...` | This server instance has no env file or an incomplete one. Check `FAZ_ENV_FILE` |
 

@@ -337,6 +337,14 @@ def sql_error_hint(error, sql):
         if m:
             return ('\nhint: the FortiAnalyzer rejects the word %r in a query, also as an '
                     'alias (... AS endpoints). Rename it (n_ep, n_eu)' % m.group(0))
+    m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
+    if m and re.search(r'\$ADOM_\w+', sql, re.I):
+        no_itime = ("the $ADOM_* tables have no itime, so $filter fails on them: drop it and "
+                    'filter epid > 1024 / euid > 1024 or on lastseen. ' if 'itime' in m.group(1) else '')
+        return ('\nhint: ' + no_itime + '$ADOM_ENDPOINT columns: epid, epname (host name), epip, '
+                'mac, lastseen; $ADOM_ENDUSER: euid, euname, email, lastseen. To turn a host name '
+                "into its IP: SELECT epname, epip, mac FROM $ADOM_ENDPOINT WHERE epid > 1024 AND "
+                "epname ILIKE '%host%' ORDER BY lastseen DESC (skill: cols-adom-tables.md)")
     m = re.search(r'Unknown function (\w+)', error)
     if m:
         fix = _FUNCTION_FIXES.get(m.group(1).lower())
