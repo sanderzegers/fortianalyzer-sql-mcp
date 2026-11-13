@@ -14,7 +14,7 @@ Queries run as background jobs: faz_query waits up to `wait` seconds and, if the
 running, returns a job_id to follow with faz_query_status / faz_query_cancel. Other tools stay
 usable meanwhile. Optional env: FAZ_JOB_TIMEOUT (seconds before a job is cancelled; default 1800),
 FAZ_MAX_JOBS (concurrent running jobs; default 2; further queries wait in a queue),
-FAZ_MAX_QUEUED (queued jobs before new ones are rejected; default 8), FAZ_MAX_WAIT (cap on
+FAZ_MAX_QUEUED (queued jobs before new ones are rejected; default 50), FAZ_MAX_WAIT (cap on
 `wait`, kept below the MCP client's request timeout; default 45), FAZ_MAX_ROWS (cap on max_rows for paging,
 100 to 1000; default 1000; 100 turns paging off).
 """
@@ -47,7 +47,8 @@ server = MCPServer(
 IDLE_LOGOUT = int(os.environ.get('FAZ_IDLE_LOGOUT', '300'))
 JOB_TIMEOUT = int(os.environ.get('FAZ_JOB_TIMEOUT', '1800'))
 MAX_JOBS = int(os.environ.get('FAZ_MAX_JOBS', '2'))
-MAX_QUEUED = int(os.environ.get('FAZ_MAX_QUEUED', '8'))
+# Agents send many queries at once (one per item); they wait in the queue, only MAX_JOBS run on the FAZ.
+MAX_QUEUED = int(os.environ.get('FAZ_MAX_QUEUED', '50'))
 MAX_WAIT = int(os.environ.get('FAZ_MAX_WAIT', '45'))  # stay below the client's request timeout
 JOB_KEEP = 900  # seconds a finished job stays retrievable
 
@@ -192,10 +193,16 @@ def _report(job):
         raise fazsql.FazError(job.error)
     if job.state == 'cancelled':
         return {'status': 'cancelled', 'job_id': job.id}
-    return {'status': job.state, 'job_id': job.id, 'elapsed_seconds': job.elapsed(),
-            'hint': 'call faz_query_status(job_id) to wait for the result'
-                    + (' (queued: %d queries are already running)' % MAX_JOBS
-                       if job.state == 'queued' else '')}
+    out = {'status': job.state, 'job_id': job.id, 'elapsed_seconds': job.elapsed(),
+           'hint': 'call faz_query_status(job_id) to wait for the result; do not submit the query again'}
+    if job.state == 'queued':
+        with _jobs_lock:
+            ahead = sum(1 for j in _jobs.values()
+                        if j.state == 'running' or (j.state == 'queued' and j.started < job.started))
+        out['queued_behind'] = ahead
+        out['hint'] += ('. It waits behind %d queries (at most %d run at once); send queries one after '
+                        'another when you can' % (ahead, MAX_JOBS))
+    return out
 
 
 async def _wait_report(job, wait):
@@ -261,7 +268,8 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     by hours between devices, so compare devices on itime.
 
     max_rows (100 up to FAZ_MAX_ROWS, at most 1000; default 100) fetches more than 100 rows by
-    paging: when the result
+    paging. It is not a LIMIT: it never returns fewer rows than 100, so leave it out unless you
+    need more than 100 rows, and put LIMIT in the SQL to get fewer. When the result
     is truncated and the query has a top-level ORDER BY, it is run again per page as
     SELECT * FROM (<sql>) LIMIT 100 OFFSET 0, 100, ... with the first page's window as a fixed
     period, and with every output column appended to the ORDER BY so ties can't repeat or skip
