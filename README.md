@@ -18,7 +18,8 @@ install on the FortiAnalyzer and no SSH access is needed.
 - `faz_query_status` / `faz_query_cancel`: follow or stop a long-running query. `faz_query` runs
   queries as background jobs and waits up to `wait` seconds (default and maximum 45, below the usual
   60-second MCP client timeout). If the query is still running or queued it returns
-  `{status: "running", job_id}` instead of blocking, and the other tools stay usable
+  `{status: "running", job_id}` instead of blocking (a queued one also says how many queries it waits
+  behind, `queued_behind`), and the other tools stay usable
 - Catches mistakes before they reach the FortiAnalyzer: a `$log` query without `$filter` (which would scan
   every stored log) and `$filter AND a OR b` (which escapes the period) are rejected with the fix. Known
   FortiAnalyzer SQL errors come back with a `hint:` line, written for models that use the tool
@@ -103,7 +104,7 @@ named by `FAZ_ENV_FILE`). Variables set in the real environment take precedence 
 | `FAZ_IDLE_LOGOUT` | Seconds of inactivity before the session is closed. Default `300`, `0` = never |
 | `FAZ_JOB_TIMEOUT` | Seconds before a running query is cancelled. Default `1800` |
 | `FAZ_MAX_JOBS` | Queries allowed to run at the same time; further ones wait in a queue. Default `2` |
-| `FAZ_MAX_QUEUED` | Queued queries before new ones are rejected. Default `8` |
+| `FAZ_MAX_QUEUED` | Queued queries before new ones are rejected. Default `50`: agents often send one query per item at once; they wait here while at most `FAZ_MAX_JOBS` run on the FortiAnalyzer |
 | `FAZ_MAX_WAIT` | Longest `wait` a call blocks for, in seconds. Keep it below your MCP client's request timeout. Default `45` |
 | `FAZ_MAX_ROWS` | Cap on `max_rows` (paging), `100` to `1000`. Default `1000`; `100` turns paging off. Lower it for a model with a small context, since every paged row comes back in the result |
 
@@ -137,7 +138,7 @@ last 7 days, and what did the top one look up?"*. Claude writes the query with t
 | `log` | Log type: `traffic`, `dns`, `attack`, `webfilter`, `event`, ... Optional, taken from the `$log-<type>` macro |
 | `period` | `today`, `yesterday`, `7d` (default), `14d`, `30d`, `this-week`, `last-week`, `this-month`, `last-month`, `this-quarter`, `last-quarter`, `this-year`, `last-n-hours` / `last-n-days` / `last-n-weeks` (with `last_n`), or `custom` (with `start` and `end`). `<N>h`, `<N>d` and `<N>w` (such as `90d`) and spellings like `last-3-days` mean the matching `last-n-*` period. `last_n` with any other period is an error |
 | `start`, `end` | For `custom`: `hh:mm YYYY/MM/DD` in the FortiAnalyzer's time zone, or relative to its clock: `now`, `-90m`, `-24h`, `-7d`, `-2w`. With a relative `start`, `end` defaults to `now` |
-| `max_rows` | 100 (default) to 1000: fetch more than 100 rows by paging (see [Paging](#paging)). Needs a top-level `ORDER BY`; each page runs the query again |
+| `max_rows` | 100 (default) to 1000: fetch more than 100 rows by paging (see [Paging](#paging)). Needs a top-level `ORDER BY`; each page runs the query again. Not a `LIMIT`: it never returns fewer than 100 rows |
 
 ### Time periods
 
