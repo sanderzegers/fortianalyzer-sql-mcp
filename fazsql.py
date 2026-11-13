@@ -143,10 +143,16 @@ _ABSOLUTE = re.compile(r'^\d{1,2}:\d{2} \d{4}/\d{1,2}/\d{1,2}$')
 # Other ways models write absolute times: '2026/10/14 00:00', '2026-10-14 00:00:00',
 # '2026-10-14T00:00', or a bare date (start of day, or end of day for `end`)
 _DATE_FIRST = re.compile(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::\d{2})?)?$')
+# Other ways models write relative times: 'now-12h', 'now - 30d', '-12 hours', 'now-90min'
+_RELATIVE_SPELLED = re.compile(r'^(?:now)?\s*-\s*(\d+)\s*(m|mins?|minutes?|h|hours?|d|days?|w|weeks?)$')
 
 
 def normalize_custom_time(value, is_end=False):
-    """Turn date-first spellings into FAZ's 'hh:mm YYYY/MM/DD'; other values unchanged."""
+    """Turn date-first spellings into FAZ's 'hh:mm YYYY/MM/DD' and spelled-out relative times
+    into '-12h'; other values unchanged."""
+    m = _RELATIVE_SPELLED.match(value)
+    if m:
+        return '-%s%s' % (m.group(1), m.group(2)[0])
     m = _DATE_FIRST.match(value)
     if not m:
         return value
@@ -258,6 +264,21 @@ def has_top_level_order_by(sql):
 def _mask_keep_length(sql):
     """The SQL with comments, strings and quoted names blanked out, same length (offsets stay valid)."""
     return _SQL_TOKEN.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), sql)
+
+
+# A keyword glued to the word before it: 'count(*) AS nFROM $log-trafficWHERE ...'. Models sometimes
+# drop the line breaks of their SQL; FAZ then reports the query as forbidden, which says nothing
+# about the cause. Upper case only, outside strings and comments, so names such as 'platform' stay.
+_GLUED_KEYWORD = re.compile(r'(?<=[a-z0-9_)])(FROM|WHERE|GROUP BY|ORDER BY|HAVING|LIMIT|UNION|JOIN)(?=[\s(]|$)')
+
+
+def unglue_keywords(sql):
+    """The SQL with a space put back before keywords glued to the previous word."""
+    body = _mask_keep_length(sql)
+    cuts = [m.start() for m in _GLUED_KEYWORD.finditer(body)]
+    for i in reversed(cuts):
+        sql = sql[:i] + ' ' + sql[i:]
+    return sql
 
 
 def with_tiebreak(sql, headers):
@@ -708,6 +729,7 @@ class FazSql:
 
     def _prepare(self, sql, dev, log, period, last_n, start, end, read_only):
         """Validate and resolve a query; returns the leading arguments of _execute."""
+        sql = unglue_keywords(sql)
         if read_only:
             check_read_only(sql)
             check_filter(sql)
