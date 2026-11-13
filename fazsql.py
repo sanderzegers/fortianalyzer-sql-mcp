@@ -266,6 +266,21 @@ def _mask_keep_length(sql):
     return _SQL_TOKEN.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), sql)
 
 
+# A keyword glued to the word before it: 'count(*) AS nFROM $log-trafficWHERE ...'. Models sometimes
+# drop the line breaks of their SQL; FAZ then reports the query as forbidden, which says nothing
+# about the cause. Upper case only, outside strings and comments, so names such as 'platform' stay.
+_GLUED_KEYWORD = re.compile(r'(?<=[a-z0-9_)])(FROM|WHERE|GROUP BY|ORDER BY|HAVING|LIMIT|UNION|JOIN)(?=[\s(]|$)')
+
+
+def unglue_keywords(sql):
+    """The SQL with a space put back before keywords glued to the previous word."""
+    body = _mask_keep_length(sql)
+    cuts = [m.start() for m in _GLUED_KEYWORD.finditer(body)]
+    for i in reversed(cuts):
+        sql = sql[:i] + ' ' + sql[i:]
+    return sql
+
+
 def with_tiebreak(sql, headers):
     """The SQL with every output column appended to its top-level ORDER BY, or None if that can't be
     done safely. Rows that tie on the query's own ORDER BY (equal counts) come back in a different
@@ -714,6 +729,7 @@ class FazSql:
 
     def _prepare(self, sql, dev, log, period, last_n, start, end, read_only):
         """Validate and resolve a query; returns the leading arguments of _execute."""
+        sql = unglue_keywords(sql)
         if read_only:
             check_read_only(sql)
             check_filter(sql)
