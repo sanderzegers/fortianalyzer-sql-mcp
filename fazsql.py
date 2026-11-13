@@ -143,10 +143,16 @@ _ABSOLUTE = re.compile(r'^\d{1,2}:\d{2} \d{4}/\d{1,2}/\d{1,2}$')
 # Other ways models write absolute times: '2026/10/14 00:00', '2026-10-14 00:00:00',
 # '2026-10-14T00:00', or a bare date (start of day, or end of day for `end`)
 _DATE_FIRST = re.compile(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::\d{2})?)?$')
+# Other ways models write relative times: 'now-12h', 'now - 30d', '-12 hours', 'now-90min'
+_RELATIVE_SPELLED = re.compile(r'^(?:now)?\s*-\s*(\d+)\s*(m|mins?|minutes?|h|hours?|d|days?|w|weeks?)$')
 
 
 def normalize_custom_time(value, is_end=False):
-    """Turn date-first spellings into FAZ's 'hh:mm YYYY/MM/DD'; other values unchanged."""
+    """Turn date-first spellings into FAZ's 'hh:mm YYYY/MM/DD' and spelled-out relative times
+    into '-12h'; other values unchanged."""
+    m = _RELATIVE_SPELLED.match(value)
+    if m:
+        return '-%s%s' % (m.group(1), m.group(2)[0])
     m = _DATE_FIRST.match(value)
     if not m:
         return value

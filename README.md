@@ -154,7 +154,8 @@ differed between queries, so rely on the `window` each result returns rather tha
 | `custom` | `start` to `end`, to the minute. An absolute `end` is included only up to `hh:mm:00`. Besides `hh:mm YYYY/MM/DD`, the tool accepts `2026-10-14 11:00`, `2026/10/14 11:00` and a bare date (start or end of that day) |
 
 For "the last 24 hours" up to now, use `period='custom', start='-24h'`. The tool turns relative times into
-FortiAnalyzer clock times, rounding the start down and the end up to the minute. Each result includes the
+FortiAnalyzer clock times, rounding the start down and the end up to the minute. Spellings such as `now-12h`,
+`now - 30d` and `-12 hours` are read as `-12h`, `-30d` and `-12h`. Each result includes the
 `window` that was covered, for example
 `{"start": "2026-10-14 17:02:00", "end": "2026-10-15 17:03:00", "tz": "Europe/Amsterdam"}`.
 
