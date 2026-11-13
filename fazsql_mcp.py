@@ -262,9 +262,10 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
 
     max_rows (100 up to FAZ_MAX_ROWS, at most 1000; default 100) fetches more than 100 rows by
     paging: when the result
-    is truncated and the query has a top-level ORDER BY (add a tiebreak column), it is run again
-    as SELECT * FROM (<sql>) LIMIT 100 OFFSET 100, 200, ... with the first page's window as a
-    fixed period. Each page is a full query on the FortiAnalyzer, so ask only for the rows you
+    is truncated and the query has a top-level ORDER BY, it is run again per page as
+    SELECT * FROM (<sql>) LIMIT 100 OFFSET 0, 100, ... with the first page's window as a fixed
+    period, and with every output column appended to the ORDER BY so ties can't repeat or skip
+    rows between pages. Each page is a full query on the FortiAnalyzer, so ask only for the rows you
     need; `paging` {pages, rows, window_fixed, stopped} says how it went.
 
     Without paging, at most 100 rows are returned, whatever the SQL LIMIT says. `total_rows` is the size of the
