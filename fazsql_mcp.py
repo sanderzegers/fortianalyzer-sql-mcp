@@ -15,7 +15,8 @@ running, returns a job_id to follow with faz_query_status / faz_query_cancel. Ot
 usable meanwhile. Optional env: FAZ_JOB_TIMEOUT (seconds before a job is cancelled; default 1800),
 FAZ_MAX_JOBS (concurrent running jobs; default 2; further queries wait in a queue),
 FAZ_MAX_QUEUED (queued jobs before new ones are rejected; default 8), FAZ_MAX_WAIT (cap on
-`wait`, kept below the MCP client's request timeout; default 45).
+`wait`, kept below the MCP client's request timeout; default 45), FAZ_MAX_ROWS (cap on max_rows for paging,
+100 to 1000; default 1000; 100 turns paging off).
 """
 import asyncio
 import atexit
@@ -39,8 +40,9 @@ server = MCPServer(
         'first query: SKILL.md, faz-sql-reference.md and the file for the device type; read them '
         'again if your context was compacted. Use faz_query to test with a short period and a '
         'small LIMIT. faz_list_types shows which log types exist per device type; faz_columns '
-        'lists the columns of a log type. Results are capped at 100 rows; when a result is '
-        'truncated, follow its `note` instead of drawing conclusions from the partial rows.'))
+        'lists the columns of a log type. Results are capped at 100 rows (max_rows pages up to 1000 '
+        'for an ORDER BY query); when a result is truncated, follow its `note` instead of drawing '
+        'conclusions from the partial rows.'))
 
 IDLE_LOGOUT = int(os.environ.get('FAZ_IDLE_LOGOUT', '300'))
 JOB_TIMEOUT = int(os.environ.get('FAZ_JOB_TIMEOUT', '1800'))
@@ -131,7 +133,7 @@ def _prepare(**kwargs):
             _touch()
 
 
-def _job_worker(job, args):
+def _job_worker(job, args, max_rows=fazsql.ROW_CAP):
     try:
         while not _slots.acquire(timeout=1):  # queued: wait for a free slot
             if job.cancel.is_set():
@@ -140,7 +142,8 @@ def _job_worker(job, args):
             job.state = 'running'
             with _lock:
                 faz = _session()
-            result = faz.run_prepared(args, JOB_TIMEOUT, lock=_lock, cancelled=job.cancel)
+            result = faz.run_prepared(args, JOB_TIMEOUT, lock=_lock, cancelled=job.cancel,
+                                      max_rows=max_rows)
             job.result, job.state = result, 'done'
         finally:
             _slots.release()
@@ -156,7 +159,7 @@ def _job_worker(job, args):
         job.done.set()
 
 
-def _submit(sql, args):
+def _submit(sql, args, max_rows=fazsql.ROW_CAP):
     with _jobs_lock:
         now = time.monotonic()
         for jid in [k for k, j in _jobs.items() if j.finished and now - j.finished > JOB_KEEP]:
@@ -167,7 +170,7 @@ def _submit(sql, args):
                                   '(faz_query_status) or cancel one (faz_query_cancel)' % active)
         job = _Job(sql)
         _jobs[job.id] = job
-    threading.Thread(target=_job_worker, args=(job, args), daemon=True,
+    threading.Thread(target=_job_worker, args=(job, args, max_rows), daemon=True,
                      name='faz-job-' + job.id).start()
     return job
 
@@ -226,7 +229,7 @@ def _run_columns(log, dev, period):
                                          idempotentHint=True, openWorldHint=False))
 async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
                     period: str = '7d', last_n: int = 0, start: str = '', end: str = '',
-                    wait: int = 45) -> dict:
+                    wait: int = 45, max_rows: int = 100) -> dict:
     """Run one read-only SELECT/WITH query against the FortiAnalyzer log database.
 
     Before your first query, read the faz-dataset skill if you have it (SKILL.md,
@@ -257,7 +260,14 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
     toString/toDate/toHour(itime) give UTC; dtime is each device's own clock, which can differ
     by hours between devices, so compare devices on itime.
 
-    At most 100 rows are returned, whatever the SQL LIMIT says. `total_rows` is the size of the
+    max_rows (100 up to FAZ_MAX_ROWS, at most 1000; default 100) fetches more than 100 rows by
+    paging: when the result
+    is truncated and the query has a top-level ORDER BY (add a tiebreak column), it is run again
+    as SELECT * FROM (<sql>) LIMIT 100 OFFSET 100, 200, ... with the first page's window as a
+    fixed period. Each page is a full query on the FortiAnalyzer, so ask only for the rows you
+    need; `paging` {pages, rows, window_fixed, stopped} says how it went.
+
+    Without paging, at most 100 rows are returned, whatever the SQL LIMIT says. `total_rows` is the size of the
     full result (a lower bound of 1000 when `total_rows_exact` is false). When `truncated` is
     true, the rows are only the first 100 in the query's order (arbitrary without ORDER BY):
     never count them or conclude a value is absent from them; follow the `note` in the result
@@ -282,12 +292,13 @@ async def faz_query(sql: str, dev: str = 'fortigate', log: str = '',
 
     Errors from the FortiAnalyzer often end with a `hint:` line: apply it before retrying.
     Returns {status: "done", headers, rows, truncated, total_rows, total_rows_exact, window,
-    adom, dev, log, job_id}, plus `note` when truncated; `adom` is the ADOM that was queried.
+    adom, dev, log, job_id}, plus `note` when truncated and `paging` when max_rows paged;
+    `adom` is the ADOM that was queried.
     """
     try:
         args = await asyncio.to_thread(_prepare, sql=sql, dev=dev, log=log or None, period=period,
                                        last_n=last_n, start=start, end=end)
-        job = _submit(sql, args)
+        job = _submit(sql, args, max_rows)
     except fazsql.FazError as e:  # anticipated failure: let the model read the reason
         raise ToolError(str(e)) from e
     try:

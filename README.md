@@ -105,6 +105,7 @@ named by `FAZ_ENV_FILE`). Variables set in the real environment take precedence 
 | `FAZ_MAX_JOBS` | Queries allowed to run at the same time; further ones wait in a queue. Default `2` |
 | `FAZ_MAX_QUEUED` | Queued queries before new ones are rejected. Default `8` |
 | `FAZ_MAX_WAIT` | Longest `wait` a call blocks for, in seconds. Keep it below your MCP client's request timeout. Default `45` |
+| `FAZ_MAX_ROWS` | Cap on `max_rows` (paging), `100` to `1000`. Default `1000`; `100` turns paging off. Lower it for a model with a small context, since every paged row comes back in the result |
 
 TLS verification is on by default.
 
@@ -136,6 +137,7 @@ last 7 days, and what did the top one look up?"*. Claude writes the query with t
 | `log` | Log type: `traffic`, `dns`, `attack`, `webfilter`, `event`, ... Optional, taken from the `$log-<type>` macro |
 | `period` | `today`, `yesterday`, `7d` (default), `14d`, `30d`, `this-week`, `last-week`, `this-month`, `last-month`, `this-quarter`, `last-quarter`, `this-year`, `last-n-hours` / `last-n-days` / `last-n-weeks` (with `last_n`), or `custom` (with `start` and `end`). `<N>h`, `<N>d` and `<N>w` (such as `90d`) and spellings like `last-3-days` mean the matching `last-n-*` period. `last_n` with any other period is an error |
 | `start`, `end` | For `custom`: `hh:mm YYYY/MM/DD` in the FortiAnalyzer's time zone, or relative to its clock: `now`, `-90m`, `-24h`, `-7d`, `-2w`. With a relative `start`, `end` defaults to `now` |
+| `max_rows` | 100 (default) to 1000: fetch more than 100 rows by paging (see [Paging](#paging)). Needs a top-level `ORDER BY`; each page runs the query again |
 
 ### Time periods
 
@@ -178,7 +180,8 @@ python fazsql.py --format csv --period today 'select ...'
 python fazsql.py --period custom --start=-24h 'select ...'   # relative times need --start=
 ```
 
-Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--timeout SECONDS` as needed.
+Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json`, `--timeout SECONDS` and
+`--max-rows N` (paging, up to 1000) as needed.
 
 ## Notes
 
@@ -188,7 +191,17 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json` and `--
 - **Row cap.** The backend returns at most 100 rows per query, whatever the SQL `LIMIT` says, and
   counts the full result up to 1000 rows (`total_rows`, with `total_rows_exact: false` beyond that).
   `truncated` is true only when rows were left out. Aggregate with `GROUP BY`, take a top N with
-  `ORDER BY ... LIMIT`, or page with a stable `ORDER BY` plus `LIMIT 100 OFFSET 100`, `200`, ...
+  `ORDER BY ... LIMIT`, or let the tool page with `max_rows` (below).
+- <a id="paging"></a>**Paging.** A result can be fetched only once and never has more than 100 rows, so
+  `max_rows` gets more by running the query again per page, as `SELECT * FROM (<sql>) LIMIT 100 OFFSET n`.
+  Only a truncated result with a top-level `ORDER BY` is paged (add a tiebreak column so the order is
+  stable), and every page uses the first page's `window` as a fixed `custom` period, so a period like
+  `7d` doesn't move while paging. Each page is a full query on the FortiAnalyzer: ask only for the rows
+  you need. The result's `paging` (`pages`, `rows`, `window_fixed`, `stopped`) shows what happened; if a
+  page fails, the rows so far are kept and `stopped` says why. All rows come back in the one result,
+  so an agent that uses the server directly gets every paged row in its context: set `FAZ_MAX_ROWS`
+  (default 1000) lower for a model with a small context, or to 100 to turn paging off. Checked on a FortiAnalyzer 7.6: 275 rows
+  in 3 pages matched a separate count of rows and of their sum exactly.
 - **Concurrency.** At most `FAZ_MAX_JOBS` queries (default 2) run at once per server instance; further
   ones wait in a queue of up to `FAZ_MAX_QUEUED`. Long queries continue in the background
   (`faz_query_status`). If the client cancels a `faz_query` call before it returns, for example on its own

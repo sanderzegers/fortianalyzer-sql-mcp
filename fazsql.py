@@ -31,6 +31,8 @@ another file, e.g. one per ADOM. Real environment variables take precedence):
                   is verified after the switch.
   FAZ_CA_BUNDLE   PEM file to trust instead of the system store
   FAZ_INSECURE=1  disable TLS verification (lab only; same as --insecure)
+  FAZ_MAX_ROWS    cap on max_rows (paging), 100 to 1000, default 1000; 100 turns paging off.
+                  Lower it for agents with a small context: they get every paged row.
 
 Use a dedicated account with only the report viewer / run report rights.
 
@@ -88,6 +90,16 @@ load_env_file()
 
 ROW_CAP = 100  # rows per fetch the backend returns, regardless of SQL LIMIT
 TOTAL_CAP = 1000  # the backend counts result rows up to this many (`total_row`)
+MAX_ROWS = 1000  # hard cap for max_rows: rows fetched by paging (each page runs the query again)
+
+
+def max_rows_cap():
+    """FAZ_MAX_ROWS (read per call, so a .env file loaded at login counts), within ROW_CAP..MAX_ROWS."""
+    try:
+        cap = int(os.environ.get('FAZ_MAX_ROWS') or MAX_ROWS)
+    except ValueError:
+        cap = MAX_ROWS
+    return max(ROW_CAP, min(cap, MAX_ROWS))
 
 # dev-type numbers (same as the documented API's `devtype`)
 DEVTYPES = {
@@ -225,6 +237,29 @@ def check_read_only(sql):
 _FILTER_TOKEN = re.compile(r'\(|\)|\$filter(?:-[a-z]+)?|[a-z_]\w*', re.I)
 _CONDITION_START = {'where', 'having', 'on', 'prewhere', 'when'}
 _CONDITION_END = {'group', 'order', 'having', 'limit', 'union', 'settings', 'then', 'window'}
+
+
+def has_top_level_order_by(sql):
+    """True when the outermost SELECT has ORDER BY (not only a subquery or OVER (...)), which paging
+    needs: without it the backend may return rows in a different order on each run."""
+    body = _SQL_TOKEN.sub(_blank_token, sql)
+    depth = 0
+    for m in re.finditer(r'\(|\)|\border\s+by\b', body, re.I):
+        t = m.group(0)
+        if t == '(':
+            depth += 1
+        elif t == ')':
+            depth -= 1
+        elif depth == 0:
+            return True
+    return False
+
+
+def _custom_time(stamp):
+    """'YYYY-MM-DD hh:mm:00' (a window bound) -> 'hh:mm YYYY/MM/DD', or None when it isn't a whole
+    minute (custom times have minute precision, so the window couldn't be repeated exactly)."""
+    m = re.fullmatch(r'(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):00', str(stamp or ''))
+    return '%s:%s %s/%s/%s' % (m.group(4), m.group(5), m.group(1), m.group(2), m.group(3)) if m else None
 
 
 def check_filter(sql):
@@ -708,7 +743,8 @@ class FazSql:
         return {'start': row['s'], 'end': row['e'], 'tz': row['tz']}
 
     def query(self, sql, dev='fortigate', log=None, period='7d', last_n=0,
-              start='', end='', timeout=120, poll=1.0, read_only=True, lock=None, cancelled=None):
+              start='', end='', timeout=120, poll=1.0, read_only=True, lock=None, cancelled=None,
+              max_rows=ROW_CAP):
         """Run one query and return {'headers','rows','truncated','total_rows','window','adom',
         'dev','log'}, plus 'note' when truncated.
 
@@ -720,12 +756,16 @@ class FazSql:
         `truncated` is True when the result had more. `total_rows` is the size of the full
         result, a lower bound when `total_rows_exact` is False. `window` is the time range $filter
         covered ({start, end, tz}), absent if it couldn't be read. lock/cancelled: see _execute.
+        max_rows (up to MAX_ROWS) pages a truncated result that has a top-level ORDER BY; each page
+        runs the query again (see _pages), and `paging` reports how it went.
         """
         args = self._prepare(sql, dev, log, period, last_n, start, end, read_only)
-        return self.run_prepared(args, timeout, poll, lock=lock, cancelled=cancelled)
+        return self.run_prepared(args, timeout, poll, lock=lock, cancelled=cancelled, max_rows=max_rows)
 
-    def run_prepared(self, args, timeout, poll=1.0, lock=None, cancelled=None):
-        """Run the arguments from _prepare: resolve relative times, query, add the window."""
+    def run_prepared(self, args, timeout, poll=1.0, lock=None, cancelled=None, max_rows=ROW_CAP):
+        """Run the arguments from _prepare: resolve relative times, query, add the window.
+
+        max_rows > ROW_CAP pages a truncated result (see _pages)."""
         args = self.resolve_relative(args, lock)
         result = self._execute(*args, timeout, poll, lock=lock, cancelled=cancelled)
         result.update(adom=self.session_adom, dev=args[1], log=args[2])
@@ -735,7 +775,66 @@ class FazSql:
             raise
         except FazError:
             pass  # the rows are what matters; the window is a convenience
+        max_rows = max(ROW_CAP, min(int(max_rows or ROW_CAP), max_rows_cap()))
+        if result['truncated'] and max_rows > ROW_CAP:
+            self._pages(result, args, timeout, poll, lock, cancelled, max_rows)
         return result
+
+    def _pages(self, result, args, timeout, poll, lock, cancelled, max_rows):
+        """Fetch the rows after the first ROW_CAP into `result`, ROW_CAP per query.
+
+        A fetch never returns more than ROW_CAP (+1) rows and a result can be fetched only once, so
+        each page runs the query again as SELECT * FROM (<sql>) LIMIT 100 OFFSET n. That is only
+        consistent when every run sees the same rows in the same order: the query needs a top-level
+        ORDER BY (ties broken by a further column), and all pages use the first page's window as a
+        fixed custom period, so a period like '7d' doesn't move while paging. Each page costs a full
+        query on the FAZ. If a page fails, the rows so far are kept and `paging` says why it stopped.
+        """
+        sql = args[0]
+        why = None
+        if not has_top_level_order_by(sql):
+            why = 'the query has no top-level ORDER BY, so pages could overlap or skip rows'
+        w = result.get('window') or {}
+        start, end = _custom_time(w.get('start')), _custom_time(w.get('end'))
+        if why is None and not (start and end):
+            why = 'its window %s - %s is not in whole minutes, so it cannot be repeated exactly' % (
+                w.get('start'), w.get('end'))
+        if why:
+            result['paging'] = {'pages': 1, 'stopped': why}
+            result['note'] = result.get('note', '') + ' Not paged: ' + why + '.'
+            return
+        fixed = (args[0], args[1], args[2], PERIOD_CUSTOM, 0, start, end)
+        rows, pages, stopped = result['rows'][:ROW_CAP], 1, None
+        more = True
+        try:
+            if self.window(fixed, lock) != w:
+                raise FazError('the fixed window differs from the first page')
+            while more and len(rows) < max_rows:
+                page = self._execute('SELECT * FROM (\n%s\n) AS _faz_page LIMIT %d OFFSET %d'
+                                     % (sql, ROW_CAP, len(rows)), *fixed[1:], timeout, poll,
+                                     lock=lock, cancelled=cancelled)
+                pages += 1
+                rows.extend(page['rows'][:ROW_CAP])
+                more = len(page['rows']) >= ROW_CAP
+        except FazCancelled:
+            raise
+        except FazError as e:
+            stopped = 'page %d failed: %s' % (pages + 1, str(e)[:200])
+        rows = rows[:max_rows]
+        truncated = more   # a full last page: there may be more rows than max_rows
+        result.update(rows=rows, truncated=truncated,
+                      total_rows=max(len(rows), result['total_rows']) if truncated else len(rows),
+                      total_rows_exact=not truncated)
+        result['paging'] = {'pages': pages, 'rows': len(rows), 'window_fixed': True}
+        if stopped:
+            result['paging']['stopped'] = stopped
+        result.pop('note', None)
+        if truncated:
+            result['note'] = ('Only the first %d result rows came back (%d pages, %s). They are the first '
+                              'rows in the query\'s order: do not count them or conclude that a value is '
+                              'missing from them. Aggregate with GROUP BY, narrow the period or filter%s.'
+                              % (len(rows), pages, 'paging stopped: ' + stopped if stopped else 'max_rows reached',
+                                 '' if len(rows) >= max_rows_cap() else ', or raise max_rows (up to %d)' % max_rows_cap()))
 
     def columns(self, log, dev='fortigate', period='7d'):
         """Column names of a log type, read from one real row (needs data in the period).
@@ -836,6 +935,9 @@ def main(argv=None):
     ap.add_argument('--end', default='',
                     help="custom end: 'hh:mm YYYY/MM/DD' or 'now' / '-1h' (default 'now' for a relative start)")
     ap.add_argument('--timeout', type=int, default=120)
+    ap.add_argument('--max-rows', type=int, default=ROW_CAP,
+                    help='page a truncated result up to this many rows (max %d; needs ORDER BY; '
+                         'each page runs the query again)' % MAX_ROWS)
     ap.add_argument('--format', choices=('tsv', 'csv', 'json'), default='tsv')
     ap.add_argument('--columns', metavar='LOG', help='list the columns of a log type (needs data)')
     ap.add_argument('--list-types', action='store_true',
@@ -864,7 +966,8 @@ def main(argv=None):
             if not a.sql:
                 ap.error('give a SQL query, or --list-types / --columns')
             result = faz.query(' '.join(a.sql), dev=a.dev or 'fortigate', log=a.log, period=a.period,
-                               last_n=a.last_n, start=a.start, end=a.end, timeout=a.timeout)
+                               last_n=a.last_n, start=a.start, end=a.end, timeout=a.timeout,
+                               max_rows=a.max_rows)
             _print(result, a.format)
         return 0
     except FazError as e:
