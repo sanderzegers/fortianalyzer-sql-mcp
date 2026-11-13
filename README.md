@@ -194,14 +194,18 @@ Use `--adom NAME`, `--adom-oid N`, `--insecure`, `--format tsv|csv|json`, `--tim
   `ORDER BY ... LIMIT`, or let the tool page with `max_rows` (below).
 - <a id="paging"></a>**Paging.** A result can be fetched only once and never has more than 100 rows, so
   `max_rows` gets more by running the query again per page, as `SELECT * FROM (<sql>) LIMIT 100 OFFSET n`.
-  Only a truncated result with a top-level `ORDER BY` is paged (add a tiebreak column so the order is
-  stable), and every page uses the first page's `window` as a fixed `custom` period, so a period like
-  `7d` doesn't move while paging. Each page is a full query on the FortiAnalyzer: ask only for the rows
+  Only a truncated result with a top-level `ORDER BY` is paged. Rows that tie on that order (equal
+  counts) come back in a different order on each run, which made pages repeat some rows and skip others
+  (9 of 500 rows in a test), so the tool appends every output column to the `ORDER BY` and runs all pages,
+  the first included, with that unique order; the query's own sort keys stay first. Every page uses the
+  first page's `window` as a fixed `custom` period, so a period like `7d` doesn't move while paging. Each page is a full query on the FortiAnalyzer: ask only for the rows
   you need. The result's `paging` (`pages`, `rows`, `window_fixed`, `stopped`) shows what happened; if a
   page fails, the rows so far are kept and `stopped` says why. All rows come back in the one result,
   so an agent that uses the server directly gets every paged row in its context: set `FAZ_MAX_ROWS`
   (default 1000) lower for a model with a small context, or to 100 to turn paging off. Checked on a FortiAnalyzer 7.6: 275 rows
-  in 3 pages matched a separate count of rows and of their sum exactly.
+  in 3 pages, and 756 rows of a query full of ties (`ORDER BY n DESC`), matched a separate count of
+  rows and of their sum exactly, with no repeated rows. `identical_rows` in `paging` counts rows that
+  occur more than once (real duplicates are possible in raw-log results, not with `GROUP BY`).
 - **Concurrency.** At most `FAZ_MAX_JOBS` queries (default 2) run at once per server instance; further
   ones wait in a queue of up to `FAZ_MAX_QUEUED`. Long queries continue in the background
   (`faz_query_status`). If the client cancels a `faz_query` call before it returns, for example on its own

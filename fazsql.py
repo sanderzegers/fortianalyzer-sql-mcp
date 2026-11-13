@@ -255,6 +255,47 @@ def has_top_level_order_by(sql):
     return False
 
 
+def _mask_keep_length(sql):
+    """The SQL with comments, strings and quoted names blanked out, same length (offsets stay valid)."""
+    return _SQL_TOKEN.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), sql)
+
+
+def with_tiebreak(sql, headers):
+    """The SQL with every output column appended to its top-level ORDER BY, or None if that can't be
+    done safely. Rows that tie on the query's own ORDER BY (equal counts) come back in a different
+    order on each run, so pages would repeat some rows and skip others; a unique order prevents it.
+    The query's own sort keys stay first."""
+    if not headers or any('`' in str(h) for h in headers):
+        return None
+    body = _mask_keep_length(sql)
+    if body.rstrip().endswith(';'):   # paging runs it as a subquery, where ';' is an error
+        cut = len(body.rstrip()) - 1
+        sql, body = sql[:cut] + ' ' + sql[cut + 1:], body[:cut] + ' ' + body[cut + 1:]
+    depth, order_at, end_at = 0, None, None
+    for m in re.finditer(r'\(|\)|\border\s+by\b|\b(limit|offset|settings|format|union|with\s+fill)\b', body, re.I):
+        t = m.group(0).lower()
+        if t == '(':
+            depth += 1
+        elif t == ')':
+            depth -= 1
+        elif depth != 0:
+            continue
+        elif t == 'union' or t.startswith('with'):
+            return None
+        elif t.startswith('order'):
+            order_at, end_at = m.end(), None
+        elif order_at is not None and end_at is None:
+            end_at = m.start()
+    if order_at is None:
+        return None
+    if end_at is None:   # end of the query, before a trailing comment or ';'
+        end_at = len(body.rstrip().rstrip(';').rstrip())
+    head = sql[:end_at].rstrip()
+    rest = sql[end_at:].strip()
+    out = head + ', ' + ', '.join('`%s`' % h for h in headers)
+    return out + ' ' + rest if rest else out
+
+
 def _custom_time(stamp):
     """'YYYY-MM-DD hh:mm:00' (a window bound) -> 'hh:mm YYYY/MM/DD', or None when it isn't a whole
     minute (custom times have minute precision, so the window couldn't be repeated exactly)."""
@@ -786,8 +827,10 @@ class FazSql:
         A fetch never returns more than ROW_CAP (+1) rows and a result can be fetched only once, so
         each page runs the query again as SELECT * FROM (<sql>) LIMIT 100 OFFSET n. That is only
         consistent when every run sees the same rows in the same order: the query needs a top-level
-        ORDER BY (ties broken by a further column), and all pages use the first page's window as a
-        fixed custom period, so a period like '7d' doesn't move while paging. Each page costs a full
+        ORDER BY, which gets every output column appended (with_tiebreak; rows that tie came back in a
+        different order per run and pages repeated or skipped them), all pages including the first
+        run with it, and all pages use the first page's window as a fixed custom period, so a period
+        like '7d' doesn't move while paging. Each page costs a full
         query on the FAZ. If a page fails, the rows so far are kept and `paging` says why it stopped.
         """
         sql = args[0]
@@ -803,15 +846,23 @@ class FazSql:
             result['paging'] = {'pages': 1, 'stopped': why}
             result['note'] = result.get('note', '') + ' Not paged: ' + why + '.'
             return
+        unique = with_tiebreak(sql, result['headers'])
+        if unique is None:
+            why = ('its ORDER BY could not be made unique (UNION, WITH FILL or unusual column names), '
+                   'so pages could repeat or skip rows')
+            result['paging'] = {'pages': 1, 'stopped': why}
+            result['note'] = result.get('note', '') + ' Not paged: ' + why + '.'
+            return
         fixed = (args[0], args[1], args[2], PERIOD_CUSTOM, 0, start, end)
-        rows, pages, stopped = result['rows'][:ROW_CAP], 1, None
-        more = True
+        # All pages, the first included, run the SQL with the unique order: the first result's
+        # order of tied rows can differ from it.
+        rows, pages, stopped, more = [], 0, None, True
         try:
             if self.window(fixed, lock) != w:
                 raise FazError('the fixed window differs from the first page')
             while more and len(rows) < max_rows:
                 page = self._execute('SELECT * FROM (\n%s\n) AS _faz_page LIMIT %d OFFSET %d'
-                                     % (sql, ROW_CAP, len(rows)), *fixed[1:], timeout, poll,
+                                     % (unique, ROW_CAP, len(rows)), *fixed[1:], timeout, poll,
                                      lock=lock, cancelled=cancelled)
                 pages += 1
                 rows.extend(page['rows'][:ROW_CAP])
@@ -820,12 +871,23 @@ class FazSql:
             raise
         except FazError as e:
             stopped = 'page %d failed: %s' % (pages + 1, str(e)[:200])
+        if not rows:   # not even the first page: keep the original 100 rows
+            result['paging'] = {'pages': 1, 'stopped': stopped}
+            result['note'] = result.get('note', '') + ' Not paged: ' + str(stopped) + '.'
+            return
         rows = rows[:max_rows]
         truncated = more   # a full last page: there may be more rows than max_rows
         result.update(rows=rows, truncated=truncated,
                       total_rows=max(len(rows), result['total_rows']) if truncated else len(rows),
                       total_rows_exact=not truncated)
-        result['paging'] = {'pages': pages, 'rows': len(rows), 'window_fixed': True}
+        result['paging'] = {'pages': pages, 'rows': len(rows), 'window_fixed': True, 'order_made_unique': True}
+        seen, repeated = set(), 0
+        for r in rows:
+            key = tuple(r)
+            repeated += key in seen
+            seen.add(key)
+        if repeated:   # identical rows: in raw-log results these can be real; with GROUP BY they can't
+            result['paging']['identical_rows'] = repeated
         if stopped:
             result['paging']['stopped'] = stopped
         result.pop('note', None)
