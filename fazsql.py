@@ -562,8 +562,85 @@ def _subquery_column_hint(error, sql):
     return ''
 
 
+def _select_lists(body):
+    """(expression, alias or None) of every SELECT list in the masked SQL `body`."""
+    out = []
+    for m in re.finditer(r'\bselect\s+(?:distinct\s+)?', body, re.I):
+        depth, start = 0, m.end()
+        for j in range(m.end(), len(body) + 1):
+            c = body[j] if j < len(body) else ','
+            end = j == len(body) or (depth == 0 and re.match(r'from\b', body[j:j + 5], re.I)
+                                     and not re.match(r'\w', body[j - 1]))
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                if depth == 0:
+                    end = True
+                depth -= 1
+            if end or (depth == 0 and c == ','):
+                item = body[start:j].strip()
+                a = re.search(r'\bas\s+(\w+)\s*$', item, re.I)
+                out.append((item[:a.start()].strip() if a else item, a.group(1) if a else None))
+                start = j + 1
+                if end:
+                    break
+    return out
+
+
+def _group_by_names(body):
+    """Plain names listed in any GROUP BY of the masked SQL `body`."""
+    names = set()
+    for m in re.finditer(r'\bgroup\s+by\b(.*?)(?=\b(?:order\s+by|having|limit|union|settings|with)\b|\)|$)',
+                         body, re.I | re.S):
+        names.update(n.strip().split('.')[-1] for n in m.group(1).split(',')
+                     if re.fullmatch(r'\s*(?:\w+\.)?\w+\s*', n))
+    return names
+
+
+def _alias_hint(error, sql):
+    """Hints for alias mistakes the FAZ error doesn't explain."""
+    body = _mask_keep_length(sql).replace('###', '   ')
+    items = _select_lists(body)
+    m = re.search(r'Duplicate alias in ARRAY JOIN: (\w+)', error)
+    if m:
+        name = m.group(1)
+        return ('\nhint: `%s` is both the ARRAY JOIN alias and a SELECT alias. Give the array '
+                'element its own name: ARRAY JOIN ipaddr AS a ... SELECT ipstr(a) AS %s'
+                % (name, name))
+    m = re.search(r'Column `?(\w+)`? is not under aggregate function.*?Have columns: \[(.*?)\]:',
+                  error, re.S)
+    if m:
+        col, have = m.group(1), re.findall(r"'((?:[^'\\]|\\.)*)'", m.group(2))
+        for expr, alias in items:
+            if alias and alias in have and re.fullmatch(r'(?:\w+\.)?%s' % re.escape(col), expr):
+                return ('\nhint: GROUP BY %s takes the real column `%s` of this table, not your alias '
+                        '(%s AS %s). Rename the alias to a name no table has (%s_n, fortigate) or '
+                        'GROUP BY %s' % (alias, alias, col, alias, alias, col))
+    m = re.search(r'Unknown identifier: (\w+)\(', error)
+    if m and _AGGREGATE.match(m.group(1) + '('):
+        grouped = _group_by_names(body)
+        for expr, alias in items:
+            if alias and alias in grouped and _AGGREGATE.search(expr):
+                return ('\nhint: GROUP BY lists `%s`, the alias of an aggregate (%s(...)). GROUP BY '
+                        'takes only plain columns: remove `%s` from it' % (alias, m.group(1), alias))
+    m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
+    if (m and re.search(r'\$log-dns\b', sql, re.I)
+            and not re.search(r'\barray\s+join\b|\barrayjoin\s*\(', body, re.I)):
+        for name in re.findall(r"'([^']+)'", m.group(1)):
+            col = name.rpartition('.')[2]
+            if re.search(r'(^|_)ip(_|$)', col, re.I) and not any(alias == col for _, alias in items):
+                return ('\nhint: `%s` is not a column of $log-dns: the answer addresses are the array '
+                        'ipaddr. For a column per address write FROM $log-dns ARRAY JOIN ipaddr AS %s '
+                        'WHERE $filter ... (ARRAY JOIN before WHERE); for one known IP, filter with '
+                        "has(ipaddr, toIPv6('...')) and don't select an address column" % (col, col))
+    return ''
+
+
 def sql_error_hint(error, sql):
     """A short fix for a known FAZ SQL error, or '' (appended to the error for the caller)."""
+    hint = _alias_hint(error, sql)
+    if hint:
+        return hint
     m = re.search(r'Column `?(\w+)`? is not under aggregate function', error)
     if m:
         name = m.group(1)
