@@ -396,15 +396,54 @@ _ERROR_HINTS = (
      "the FortiAnalyzer's own query time limit: use a shorter period, put the most selective "
      'condition first and aggregate instead of returning rows'),
     (r'SQL query is forbidden',
-     'the FortiAnalyzer refused the query text. A possible cause is a write keyword (delete, '
-     "rename, drop, ...) inside a string literal, e.g. LIKE '%Delete%': reword it "
-     "(lower(msg) LIKE '%delet%')"),
+     'the FortiAnalyzer answers every syntax error this way, so ClickHouse never saw the query. '
+     'Check the clause order (FROM ... ARRAY JOIN ... JOIN ... WHERE ... GROUP BY ... HAVING ... '
+     'ORDER BY ... LIMIT), that every parenthesis and ###( ... )### pair is closed, and that no '
+     'keyword is glued to a word. The words it blocks: hash-named functions, version(), '
+     'endpoints, endusers'),
 )
 
 
 _AGGREGATE = re.compile(
     r'(count|sum|avg|min|max|any|anyLast|uniq\w*|groupArray\w*|groupUniqArray\w*|quantile\w*|'
     r'median\w*|argMin|argMax|topK\w*|stddev\w*|var\w*)(If)?\(', re.I)
+
+
+_CLAUSE = re.compile(r'\(|\)|\bselect\b|\b(?:where|having|limit|prewhere)\b|\b(?:group|order)\s+by\b'
+                     r'|\b(?:left\s+|inner\s+)?array\s+join\b', re.I)
+
+
+def _syntax_hint(sql):
+    """The FAZ reports a syntax error only as 'SQL query is forbidden'; find the common ones here."""
+    body = _mask_keep_length(sql)
+    rest = body.replace('###(', '(').replace(')###', ')')
+    if '###' in rest:
+        return ('\nhint: a ###( ... )### marker is broken (stray ###): write a FAZ subquery as '
+                '###(SELECT ...)### with nothing else between the ### and the parenthesis')
+    opened, closed = rest.count('('), rest.count(')')
+    if opened != closed:
+        return ('\nhint: the query has %d "(" but %d ")": close every parenthesis (the FAZ reports '
+                'the syntax error only as "forbidden")' % (opened, closed))
+    after = [None]
+    for m in _CLAUSE.finditer(rest):
+        t = re.sub(r'\s+', ' ', m.group(0).lower())
+        if t == '(':
+            after.append(None)
+        elif t == ')':
+            if len(after) > 1:
+                after.pop()
+        elif t == 'select':
+            after[-1] = None
+        elif t.endswith('array join'):
+            if after[-1]:
+                return ('\nhint: ARRAY JOIN must come right after FROM <table>, before WHERE '
+                        '(FROM $log-dns ARRAY JOIN ipaddr AS ip WHERE $filter AND ...); here it '
+                        'follows %s, which is a syntax error that the FAZ reports only as '
+                        '"forbidden". A WHERE condition on the array (hasAny(ipaddr, ...)) still '
+                        'filters before the rows are expanded' % after[-1].upper())
+        elif not after[-1]:
+            after[-1] = t
+    return ''
 
 
 def sql_error_hint(error, sql):
@@ -434,6 +473,9 @@ def sql_error_hint(error, sql):
         if m:
             return ('\nhint: the FortiAnalyzer rejects the word %r in a query, also as an '
                     'alias (... AS endpoints). Rename it (n_ep, n_eu)' % m.group(0))
+        hint = _syntax_hint(sql)
+        if hint:
+            return hint
     m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
     if m and re.search(r'\$ADOM_\w+', sql, re.I):
         no_itime = ("the $ADOM_* tables have no itime, so $filter fails on them: drop it and "
