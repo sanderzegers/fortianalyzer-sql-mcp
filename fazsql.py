@@ -446,6 +446,122 @@ def _syntax_hint(sql):
     return ''
 
 
+_SOURCE_END = {'where', 'group', 'order', 'having', 'limit', 'on', 'using', 'join', 'left', 'right',
+               'inner', 'outer', 'full', 'cross', 'any', 'all', 'array', 'global', 'union', 'settings',
+               'prewhere', 'final', 'sample', 'format', 'as'}
+
+
+def _closing(body, i):
+    """Offset of the parenthesis that closes the one at body[i], or None."""
+    depth = 0
+    for j in range(i, len(body)):
+        if body[j] == '(':
+            depth += 1
+        elif body[j] == ')':
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def _select_names(inner):
+    """Column names the SELECT `inner` (masked) returns, or None when it can't tell (*, WITH, UNION)."""
+    m = re.match(r'\s*select\s+(?:distinct\s+)?', inner, re.I)
+    if not m or re.search(r'\bunion\b', inner, re.I):
+        return None
+    depth, items, start = 0, [], m.end()
+    for j in range(m.end(), len(inner)):
+        c = inner[j]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0 and c == ',':
+            items.append(inner[start:j])
+            start = j + 1
+        elif depth == 0 and re.match(r'from\b', inner[j:j + 5], re.I) and not re.match(r'\w', inner[j - 1]):
+            break
+    else:
+        return None
+    items.append(inner[start:j])
+    names = []
+    for item in (i.strip() for i in items):
+        if '*' in item and not re.search(r'\(.*\*.*\)', item):
+            return None
+        a = re.search(r'\bas\s+(\w+)\s*$', item, re.I) or re.fullmatch(r'(?:\w+\.)?(\w+)', item)
+        if a:
+            names.append(a.group(1))
+    return names
+
+
+def _top_level_sources(sql):
+    """The FROM/JOIN sources of the outermost query: (alias or None, names or 'table', span)."""
+    body = _mask_keep_length(sql).replace('###', '   ')
+    out, depth, i = [], 0, 0
+    for m in re.finditer(r'\(|\)|\b(?:from|join)\b', body, re.I):
+        t = m.group(0)
+        if t == '(':
+            depth += 1
+            continue
+        if t == ')':
+            depth -= 1
+            continue
+        if depth != 0 or m.start() < i:
+            continue
+        rest = body[m.end():]
+        p = re.match(r'\s*\(', rest)
+        if p:
+            open_at = m.end() + p.end() - 1
+            close = _closing(body, open_at)
+            if close is None:
+                return []
+            names = _select_names(body[open_at + 1:close])
+            a = re.match(r'\s*(?:as\s+)?(\w+)', body[close + 1:], re.I)
+            alias = a.group(1) if a and a.group(1).lower() not in _SOURCE_END else None
+            out.append((alias, names, (open_at, close)))
+            i = close
+            continue
+        t = re.match(r'\s*(\$?[\w-]+)(?:\s+(?:as\s+)?(\w+))?', rest, re.I)
+        if t:
+            alias = t.group(2) if t.group(2) and t.group(2).lower() not in _SOURCE_END else None
+            out.append((alias or t.group(1), 'table', None))
+    return out
+
+
+def _subquery_column_hint(error, sql):
+    """For 'Missing columns' / "no column 'x.y'": name the alias or inner query the column isn't in."""
+    m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
+    missing = re.findall(r"'([^']+)'", m.group(1)) if m else []
+    missing += re.findall(r"There's no column '([^']+)' in table", error)
+    sources = _top_level_sources(sql)
+    if not missing or not sources:
+        return ''
+    body = _mask_keep_length(sql).replace('###', '   ')
+    for name in missing:
+        qual, _, col = name.rpartition('.')
+        if qual:
+            src = [s for s in sources if s[0] == qual]
+            if not src:
+                return ('\nhint: `%s` is not a table alias in this query, so `%s` fails: write `%s`, '
+                        'or give the table that alias (FROM ... %s)' % (qual, name, col, qual))
+            names = src[0][1]
+            if names not in ('table', None) and col not in names:
+                return ('\nhint: the inner query `%s` returns only: %s. `%s` is not one of them: use '
+                        'one of these names, or also select `%s` in the inner query'
+                        % (qual, ', '.join(names), col, col))
+            continue
+        subs = [s for s in sources if s[1] != 'table']
+        if len(sources) != 1 or len(subs) != 1 or subs[0][1] is None or col in subs[0][1]:
+            continue
+        a, b = subs[0][2]
+        outside = body[:a] + body[b + 1:]
+        if re.search(r'(?<![\w.])%s\b' % re.escape(col), outside):
+            return ('\nhint: `%s` is used in the outer query, but the inner query (FROM (...)) returns '
+                    'only: %s. Use one of these names, or also select `%s` in the inner query (and add '
+                    'it to its GROUP BY)' % (col, ', '.join(subs[0][1]), col))
+    return ''
+
+
 def sql_error_hint(error, sql):
     """A short fix for a known FAZ SQL error, or '' (appended to the error for the caller)."""
     m = re.search(r'Column `?(\w+)`? is not under aggregate function', error)
@@ -484,6 +600,9 @@ def sql_error_hint(error, sql):
                 'mac, lastseen; $ADOM_ENDUSER: euid, euname, email, lastseen. To turn a host name '
                 "into its IP: SELECT epname, epip, mac FROM $ADOM_ENDPOINT WHERE epid > 1024 AND "
                 "epname ILIKE '%host%' ORDER BY lastseen DESC (skill: cols-adom-tables.md)")
+    hint = _subquery_column_hint(error, sql)
+    if hint:
+        return hint
     m = re.search(r'Unknown function (\w+)', error)
     if m:
         fix = _FUNCTION_FIXES.get(m.group(1).lower())
