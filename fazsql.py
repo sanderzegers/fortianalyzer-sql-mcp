@@ -396,9 +396,11 @@ _ERROR_HINTS = (
      "the FortiAnalyzer's own query time limit: use a shorter period, put the most selective "
      'condition first and aggregate instead of returning rows'),
     (r'SQL query is forbidden',
-     'the FortiAnalyzer refused the query text. A possible cause is a write keyword (delete, '
-     "rename, drop, ...) inside a string literal, e.g. LIKE '%Delete%': reword it "
-     "(lower(msg) LIKE '%delet%')"),
+     'the FortiAnalyzer answers every syntax error this way, so ClickHouse never saw the query. '
+     'Check the clause order (FROM ... ARRAY JOIN ... JOIN ... WHERE ... GROUP BY ... HAVING ... '
+     'ORDER BY ... LIMIT), that every parenthesis and ###( ... )### pair is closed, and that no '
+     'keyword is glued to a word. The words it blocks: hash-named functions, version(), '
+     'endpoints, endusers'),
 )
 
 
@@ -407,8 +409,238 @@ _AGGREGATE = re.compile(
     r'median\w*|argMin|argMax|topK\w*|stddev\w*|var\w*)(If)?\(', re.I)
 
 
+_CLAUSE = re.compile(r'\(|\)|\bselect\b|\b(?:where|having|limit|prewhere)\b|\b(?:group|order)\s+by\b'
+                     r'|\b(?:left\s+|inner\s+)?array\s+join\b', re.I)
+
+
+def _syntax_hint(sql):
+    """The FAZ reports a syntax error only as 'SQL query is forbidden'; find the common ones here."""
+    body = _mask_keep_length(sql)
+    rest = body.replace('###(', '(').replace(')###', ')')
+    if '###' in rest:
+        return ('\nhint: a ###( ... )### marker is broken (stray ###): write a FAZ subquery as '
+                '###(SELECT ...)### with nothing else between the ### and the parenthesis')
+    opened, closed = rest.count('('), rest.count(')')
+    if opened != closed:
+        return ('\nhint: the query has %d "(" but %d ")": close every parenthesis (the FAZ reports '
+                'the syntax error only as "forbidden")' % (opened, closed))
+    after = [None]
+    for m in _CLAUSE.finditer(rest):
+        t = re.sub(r'\s+', ' ', m.group(0).lower())
+        if t == '(':
+            after.append(None)
+        elif t == ')':
+            if len(after) > 1:
+                after.pop()
+        elif t == 'select':
+            after[-1] = None
+        elif t.endswith('array join'):
+            if after[-1]:
+                return ('\nhint: ARRAY JOIN must come right after FROM <table>, before WHERE '
+                        '(FROM $log-dns ARRAY JOIN ipaddr AS ip WHERE $filter AND ...); here it '
+                        'follows %s, which is a syntax error that the FAZ reports only as '
+                        '"forbidden". A WHERE condition on the array (hasAny(ipaddr, ...)) still '
+                        'filters before the rows are expanded' % after[-1].upper())
+        elif not after[-1]:
+            after[-1] = t
+    return ''
+
+
+_SOURCE_END = {'where', 'group', 'order', 'having', 'limit', 'on', 'using', 'join', 'left', 'right',
+               'inner', 'outer', 'full', 'cross', 'any', 'all', 'array', 'global', 'union', 'settings',
+               'prewhere', 'final', 'sample', 'format', 'as'}
+
+
+def _closing(body, i):
+    """Offset of the parenthesis that closes the one at body[i], or None."""
+    depth = 0
+    for j in range(i, len(body)):
+        if body[j] == '(':
+            depth += 1
+        elif body[j] == ')':
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def _select_names(inner):
+    """Column names the SELECT `inner` (masked) returns, or None when it can't tell (*, WITH, UNION)."""
+    m = re.match(r'\s*select\s+(?:distinct\s+)?', inner, re.I)
+    if not m or re.search(r'\bunion\b', inner, re.I):
+        return None
+    depth, items, start = 0, [], m.end()
+    for j in range(m.end(), len(inner)):
+        c = inner[j]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0 and c == ',':
+            items.append(inner[start:j])
+            start = j + 1
+        elif depth == 0 and re.match(r'from\b', inner[j:j + 5], re.I) and not re.match(r'\w', inner[j - 1]):
+            break
+    else:
+        return None
+    items.append(inner[start:j])
+    names = []
+    for item in (i.strip() for i in items):
+        if '*' in item and not re.search(r'\(.*\*.*\)', item):
+            return None
+        a = re.search(r'\bas\s+(\w+)\s*$', item, re.I) or re.fullmatch(r'(?:\w+\.)?(\w+)', item)
+        if a:
+            names.append(a.group(1))
+    return names
+
+
+def _top_level_sources(sql):
+    """The FROM/JOIN sources of the outermost query: (alias or None, names or 'table', span)."""
+    body = _mask_keep_length(sql).replace('###', '   ')
+    out, depth, i = [], 0, 0
+    for m in re.finditer(r'\(|\)|\b(?:from|join)\b', body, re.I):
+        t = m.group(0)
+        if t == '(':
+            depth += 1
+            continue
+        if t == ')':
+            depth -= 1
+            continue
+        if depth != 0 or m.start() < i:
+            continue
+        rest = body[m.end():]
+        p = re.match(r'\s*\(', rest)
+        if p:
+            open_at = m.end() + p.end() - 1
+            close = _closing(body, open_at)
+            if close is None:
+                return []
+            names = _select_names(body[open_at + 1:close])
+            a = re.match(r'\s*(?:as\s+)?(\w+)', body[close + 1:], re.I)
+            alias = a.group(1) if a and a.group(1).lower() not in _SOURCE_END else None
+            out.append((alias, names, (open_at, close)))
+            i = close
+            continue
+        t = re.match(r'\s*(\$?[\w-]+)(?:\s+(?:as\s+)?(\w+))?', rest, re.I)
+        if t:
+            alias = t.group(2) if t.group(2) and t.group(2).lower() not in _SOURCE_END else None
+            out.append((alias or t.group(1), 'table', None))
+    return out
+
+
+def _subquery_column_hint(error, sql):
+    """For 'Missing columns' / "no column 'x.y'": name the alias or inner query the column isn't in."""
+    m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
+    missing = re.findall(r"'([^']+)'", m.group(1)) if m else []
+    missing += re.findall(r"There's no column '([^']+)' in table", error)
+    sources = _top_level_sources(sql)
+    if not missing or not sources:
+        return ''
+    body = _mask_keep_length(sql).replace('###', '   ')
+    for name in missing:
+        qual, _, col = name.rpartition('.')
+        if qual:
+            src = [s for s in sources if s[0] == qual]
+            if not src:
+                return ('\nhint: `%s` is not a table alias in this query, so `%s` fails: write `%s`, '
+                        'or give the table that alias (FROM ... %s)' % (qual, name, col, qual))
+            names = src[0][1]
+            if names not in ('table', None) and col not in names:
+                return ('\nhint: the inner query `%s` returns only: %s. `%s` is not one of them: use '
+                        'one of these names, or also select `%s` in the inner query'
+                        % (qual, ', '.join(names), col, col))
+            continue
+        subs = [s for s in sources if s[1] != 'table']
+        if len(sources) != 1 or len(subs) != 1 or subs[0][1] is None or col in subs[0][1]:
+            continue
+        a, b = subs[0][2]
+        outside = body[:a] + body[b + 1:]
+        if re.search(r'(?<![\w.])%s\b' % re.escape(col), outside):
+            return ('\nhint: `%s` is used in the outer query, but the inner query (FROM (...)) returns '
+                    'only: %s. Use one of these names, or also select `%s` in the inner query (and add '
+                    'it to its GROUP BY)' % (col, ', '.join(subs[0][1]), col))
+    return ''
+
+
+def _select_lists(body):
+    """(expression, alias or None) of every SELECT list in the masked SQL `body`."""
+    out = []
+    for m in re.finditer(r'\bselect\s+(?:distinct\s+)?', body, re.I):
+        depth, start = 0, m.end()
+        for j in range(m.end(), len(body) + 1):
+            c = body[j] if j < len(body) else ','
+            end = j == len(body) or (depth == 0 and re.match(r'from\b', body[j:j + 5], re.I)
+                                     and not re.match(r'\w', body[j - 1]))
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                if depth == 0:
+                    end = True
+                depth -= 1
+            if end or (depth == 0 and c == ','):
+                item = body[start:j].strip()
+                a = re.search(r'\bas\s+(\w+)\s*$', item, re.I)
+                out.append((item[:a.start()].strip() if a else item, a.group(1) if a else None))
+                start = j + 1
+                if end:
+                    break
+    return out
+
+
+def _group_by_names(body):
+    """Plain names listed in any GROUP BY of the masked SQL `body`."""
+    names = set()
+    for m in re.finditer(r'\bgroup\s+by\b(.*?)(?=\b(?:order\s+by|having|limit|union|settings|with)\b|\)|$)',
+                         body, re.I | re.S):
+        names.update(n.strip().split('.')[-1] for n in m.group(1).split(',')
+                     if re.fullmatch(r'\s*(?:\w+\.)?\w+\s*', n))
+    return names
+
+
+def _alias_hint(error, sql):
+    """Hints for alias mistakes the FAZ error doesn't explain."""
+    body = _mask_keep_length(sql).replace('###', '   ')
+    items = _select_lists(body)
+    m = re.search(r'Duplicate alias in ARRAY JOIN: (\w+)', error)
+    if m:
+        name = m.group(1)
+        return ('\nhint: `%s` is both the ARRAY JOIN alias and a SELECT alias. Give the array '
+                'element its own name: ARRAY JOIN ipaddr AS a ... SELECT ipstr(a) AS %s'
+                % (name, name))
+    m = re.search(r'Column `?(\w+)`? is not under aggregate function.*?Have columns: \[(.*?)\]:',
+                  error, re.S)
+    if m:
+        col, have = m.group(1), re.findall(r"'((?:[^'\\]|\\.)*)'", m.group(2))
+        for expr, alias in items:
+            if alias and alias in have and re.fullmatch(r'(?:\w+\.)?%s' % re.escape(col), expr):
+                return ('\nhint: GROUP BY %s takes the real column `%s` of this table, not your alias '
+                        '(%s AS %s). Rename the alias to a name no table has (%s_n, fortigate) or '
+                        'GROUP BY %s' % (alias, alias, col, alias, alias, col))
+    m = re.search(r'Unknown identifier: (\w+)\(', error)
+    if m and _AGGREGATE.match(m.group(1) + '('):
+        grouped = _group_by_names(body)
+        for expr, alias in items:
+            if alias and alias in grouped and _AGGREGATE.search(expr):
+                return ('\nhint: GROUP BY lists `%s`, the alias of an aggregate (%s(...)). GROUP BY '
+                        'takes only plain columns: remove `%s` from it' % (alias, m.group(1), alias))
+    m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
+    if (m and re.search(r'\$log-dns\b', sql, re.I)
+            and not re.search(r'\barray\s+join\b|\barrayjoin\s*\(', body, re.I)):
+        for name in re.findall(r"'([^']+)'", m.group(1)):
+            col = name.rpartition('.')[2]
+            if re.search(r'(^|_)ip(_|$)', col, re.I) and not any(alias == col for _, alias in items):
+                return ('\nhint: `%s` is not a column of $log-dns: the answer addresses are the array '
+                        'ipaddr. For a column per address write FROM $log-dns ARRAY JOIN ipaddr AS %s '
+                        'WHERE $filter ... (ARRAY JOIN before WHERE); for one known IP, filter with '
+                        "has(ipaddr, toIPv6('...')) and don't select an address column" % (col, col))
+    return ''
+
+
 def sql_error_hint(error, sql):
     """A short fix for a known FAZ SQL error, or '' (appended to the error for the caller)."""
+    hint = _alias_hint(error, sql)
+    if hint:
+        return hint
     m = re.search(r'Column `?(\w+)`? is not under aggregate function', error)
     if m:
         name = m.group(1)
@@ -434,6 +666,9 @@ def sql_error_hint(error, sql):
         if m:
             return ('\nhint: the FortiAnalyzer rejects the word %r in a query, also as an '
                     'alias (... AS endpoints). Rename it (n_ep, n_eu)' % m.group(0))
+        hint = _syntax_hint(sql)
+        if hint:
+            return hint
     m = re.search(r'Missing columns:(.*?)while processing', error, re.S)
     if m and re.search(r'\$ADOM_\w+', sql, re.I):
         no_itime = ("the $ADOM_* tables have no itime, so $filter fails on them: drop it and "
@@ -442,6 +677,9 @@ def sql_error_hint(error, sql):
                 'mac, lastseen; $ADOM_ENDUSER: euid, euname, email, lastseen. To turn a host name '
                 "into its IP: SELECT epname, epip, mac FROM $ADOM_ENDPOINT WHERE epid > 1024 AND "
                 "epname ILIKE '%host%' ORDER BY lastseen DESC (skill: cols-adom-tables.md)")
+    hint = _subquery_column_hint(error, sql)
+    if hint:
+        return hint
     m = re.search(r'Unknown function (\w+)', error)
     if m:
         fix = _FUNCTION_FIXES.get(m.group(1).lower())
